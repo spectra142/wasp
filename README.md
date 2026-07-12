@@ -3,24 +3,32 @@
 [![CI](https://github.com/spectra142/wasp/actions/workflows/ci.yml/badge.svg)](https://github.com/spectra142/wasp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-WASP is a fast, modular security reconnaissance scanner written in Rust. Point it at a domain or IP and it will enumerate DNS records, scan ports, inspect HTTP/TLS configuration, hunt for exposed secrets and files, and generate consolidated reports in JSON, HTML, CSV, Markdown, and SARIF.
+WASP is a fast, modular security reconnaissance scanner written in Rust. Point it at a domain or IP address and it will discover attack surface: DNS records, open ports, web security issues, leaked secrets, weak TLS settings, and more. It then writes everything into clean reports in JSON, HTML, CSV, Markdown, and SARIF.
 
 > **⚠️ Only scan targets you own or have explicit written permission to test.** Unauthorized scanning may be illegal.
 
-## Features
+> **🚧 Work in progress.** WASP is still in early development. Expect breaking changes, rough edges, and new modules as the project grows. Issues and pull requests are welcome.
 
-- **No external dependencies required** for the built-in modules
-- **Async/concurrent** scanning with a single global concurrency limit
-- **Multiple report formats** out of the box: JSON, HTML, CSV, Markdown, SARIF 2.1.0
-- **Optional adapters** for `nmap`, `nuclei`, `testssl.sh`, and `wpscan`
-- **Configurable via TOML** with per-module toggles and proxy support
-- **Clean exit behavior**: missing external tools can be skipped instead of failing the whole scan
+---
+
+## What WASP does
+
+In plain English:
+
+1. You give it a target like `example.com` or `192.168.1.1`.
+2. It runs a set of small scanners (modules) against that target.
+3. Each module looks for a specific kind of issue.
+4. Results are combined, deduplicated, and written to a report folder.
+
+You can run everything with one command, pick only the modules you want, or tune behavior through a config file.
 
 ## Built-in modules
 
+These work out of the box with no extra tools installed:
+
 | Module | What it checks |
 |--------|----------------|
-| `recon` | DNS (A/AAAA/MX/NS/TXT), WHOIS with referral following, subdomain brute-force with wildcard detection, technology fingerprinting |
+| `recon` | DNS records (A/AAAA/MX/NS/TXT), WHOIS with referral following, subdomain brute-force with wildcard detection, technology fingerprinting |
 | `portscan` | TCP connect scan, banner grabbing, service/version fingerprinting, TLS-first port handling |
 | `web` | Security headers, cookie flags, HTTPS redirect, TLS chain trust |
 | `secrets` | Exposed path brute-force, regex-based secret detection, endpoint extraction |
@@ -30,6 +38,8 @@ WASP is a fast, modular security reconnaissance scanner written in Rust. Point i
 
 ## Optional external adapters
 
+If you have these tools installed, WASP can call them:
+
 | Module | External tool | Enabled by default |
 |--------|---------------|-------------------|
 | `nmap` | `nmap` | no |
@@ -37,9 +47,15 @@ WASP is a fast, modular security reconnaissance scanner written in Rust. Point i
 | `testssl` | `testssl.sh` | no |
 | `cms` | `wpscan` | no |
 
+By default, missing external tools are skipped with an Info finding instead of crashing the scan.
+
+---
+
 ## Install
 
-You need Rust 1.80 or newer.
+You need [Rust](https://www.rust-lang.org/tools/install) version 1.80 or newer.
+
+Open a terminal and run:
 
 ```bash
 git clone https://github.com/spectra142/wasp.git
@@ -47,55 +63,87 @@ cd wasp
 cargo build --release
 ```
 
-The binary is at `./target/release/wasp`.
-
-## Quick start
+This downloads dependencies and builds the scanner. The finished binary is at:
 
 ```bash
-# Scan a target with default settings
-./target/release/wasp example.com
+./target/release/wasp
+```
 
+You can copy that binary anywhere you like, but keep the `config/` and `wordlists/` folders nearby if you want the default settings to work without editing paths.
+
+---
+
+## How to use it
+
+### Basic scan
+
+```bash
+./target/release/wasp example.com
+```
+
+This runs the default modules and writes reports to `./wasp-report/`.
+
+### Common options
+
+```bash
 # Run only the fast built-in modules
 ./target/release/wasp example.com --quick
 
 # Run everything, including external adapters if installed
 ./target/release/wasp example.com --full
 
-# Pick specific modules and write reports to a directory
-./target/release/wasp example.com -m recon,web,tlsaudit -o ./report
+# Pick specific modules
+./target/release/wasp example.com -m recon,web,tlsaudit
 
-# Limit concurrency
+# Write reports to a custom directory
+./target/release/wasp example.com -o ./my-report
+
+# Limit how many connections run at once
 ./target/release/wasp example.com -r 50
 
 # Use a custom config file
 ./target/release/wasp example.com -c myconfig.toml
 
-# Safe mode: disables port scanning and exposed-path probing
+# Safe mode: turns off port scanning and exposed-path probing
 ./target/release/wasp example.com --safe-mode
 
 # Disable TLS certificate verification (useful for self-signed/internal targets)
 ./target/release/wasp example.com --insecure
 ```
 
-## Output
+Run `./target/release/wasp --help` to see every option.
 
-By default reports are written to `./wasp-report/`:
+---
 
-- `report.json` — structured findings
-- `report.html` — human-readable report with severity summary
-- `report.csv` — spreadsheet-friendly output
-- `report.md` — markdown summary
-- `report.sarif` — SARIF 2.1.0 for import into GitHub Code Scanning, DefectDojo, etc.
+## Reports
+
+By default WASP creates a `wasp-report/` folder with:
+
+| File | Purpose |
+|------|---------|
+| `report.json` | Structured findings, easy to feed into other tools |
+| `report.html` | Human-readable report with severity summary |
+| `report.csv` | Spreadsheet-friendly output |
+| `report.md` | Markdown summary |
+| `report.sarif` | SARIF 2.1.0 for GitHub Code Scanning, DefectDojo, etc. |
+
+---
 
 ## Configuration
 
-Copy `config/default.toml` and edit it. Useful options:
+The default config is `config/default.toml`. Copy it and edit the copy:
+
+```bash
+cp config/default.toml myconfig.toml
+```
+
+Useful options:
 
 - `scanner.concurrency` — global concurrent connection/module-task limit
-- `scanner.timeout_ms` — per-request timeout
+- `scanner.timeout_ms` — per-request timeout in milliseconds
 - `scanner.verify_tls_certificates` — verify HTTPS certificates (default: `true`; disable with `--insecure`)
 - `scanner.http_proxy` / `scanner.https_proxy` — optional proxy URLs
-- `scanner.custom_headers` — default headers for every HTTP request
+- `scanner.custom_headers` — default headers added to every HTTP request
 - `modules.portscan.top_ports` — number of ports to scan (1..N)
 - `modules.recon.subdomain_wordlist` — path to subdomain wordlist
 - `modules.secrets.path_wordlist` — path to exposed-path wordlist
@@ -105,9 +153,13 @@ Copy `config/default.toml` and edit it. Useful options:
 - `tools.nmap_timeout_secs`, `tools.testssl_timeout_secs`, `tools.nuclei_timeout_secs`, `tools.wpscan_timeout_secs` — timeouts for heavy external tools
 - `tools.skip_missing_tools` — if `true`, missing external tools produce an Info finding instead of an error
 
-Relative wordlist/config paths in a custom config file are resolved against that config file's directory.
+If you use a custom config file, relative wordlist paths are resolved against that config file's directory.
+
+---
 
 ## Updating
+
+To get the latest version:
 
 ```bash
 cd wasp
@@ -115,7 +167,11 @@ git pull
 cargo build --release
 ```
 
+---
+
 ## Development
+
+Run the quality gates before submitting changes:
 
 ```bash
 cargo test
@@ -125,9 +181,9 @@ cargo fmt --check
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for how to add modules, open issues, and submit pull requests.
 
-## Security
-
 See [SECURITY.md](SECURITY.md) for vulnerability reporting and responsible-use guidelines.
+
+---
 
 ## License
 
