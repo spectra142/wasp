@@ -5,6 +5,7 @@ edition = "2024"
 authors = ["WASP Contributors"]
 description = "Web Attack Surface Profiler - a modular security reconnaissance scanner"
 license = "MIT"
+repository = "https://github.com/spectra142/wasp"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

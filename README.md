@@ -1,6 +1,6 @@
 # WASP — Web Attack Surface Profiler
 
-[![CI](https://github.com/OWNER/REPO/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/REPO/actions/workflows/ci.yml)
+[![CI](https://github.com/spectra142/wasp/actions/workflows/ci.yml/badge.svg)](https://github.com/spectra142/wasp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 WASP is a modular, async security reconnaissance scanner written in Rust. Given a domain or IP, it discovers attack surface, scans ports, inspects web security posture, hunts exposed secrets and files, and produces consolidated reports.
@@ -42,8 +42,8 @@ cargo build --release
 ## Installation
 
 ```bash
-git clone https://github.com/OWNER/REPO.git
-cd REPO
+git clone https://github.com/spectra142/wasp.git
+cd wasp
 cargo build --release
 # Binary will be at ./target/release/wasp
 ```
