@@ -183,6 +183,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for how to add modules, open issues, and 
 
 See [SECURITY.md](SECURITY.md) for vulnerability reporting and responsible-use guidelines.
 
+See [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) for a complete file-by-file breakdown of the codebase.
+
 ---
 
 ## License
