@@ -40,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - testssl.sh temporary file uses `tempfile::NamedTempFile` to avoid race conditions.
 - `--rate` / `-r` now correctly rebuilds the global concurrency semaphore instead of only updating the logged number.
 - nmap module now passes `-Pn` so scans proceed even when ICMP host discovery is filtered.
+- README rewritten for a general audience with clearer install/run instructions and a development-warning notice.
 
 ## [0.1.0] - 2026-07-12
 
