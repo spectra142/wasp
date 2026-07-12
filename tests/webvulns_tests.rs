@@ -4,7 +4,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use wasp::config::Config;
 use wasp::finding::Severity;
-use wasp::modules::{Module, webvulns::WebVulns};
+use wasp::modules::{webvulns::WebVulns, Module};
 use wasp::target::Target;
 
 /// Local HTTP fixture tailored to exercise every webvulns check.
@@ -219,12 +219,10 @@ async fn detects_cors_origin_reflection_with_credentials() {
     .expect("missing CORS reflection finding");
     assert_eq!(finding.severity, Severity::High);
     assert!(finding.evidence.iter().any(|e| e.contains("/api")));
-    assert!(
-        finding
-            .evidence
-            .iter()
-            .any(|e| e.contains("wasp-cors-test.example"))
-    );
+    assert!(finding
+        .evidence
+        .iter()
+        .any(|e| e.contains("wasp-cors-test.example")));
 }
 
 #[tokio::test]

@@ -364,9 +364,15 @@ fn parse_port_ranges(s: &str) -> Result<Vec<u16>, std::num::ParseIntError> {
 async fn run_portscan(target: &Target, config: &Config, ports: &[u16]) -> Result<Vec<Finding>> {
     let mut findings = Vec::new();
     let host = target.host();
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(
-        config.scanner.concurrency.max(1),
-    ));
+    let semaphore = config
+        .scanner
+        .concurrency_semaphore
+        .clone()
+        .unwrap_or_else(|| {
+            Arc::new(tokio::sync::Semaphore::new(
+                config.scanner.concurrency.max(1),
+            ))
+        });
     let connect_timeout = config.timeout();
     let banner_bytes = config.modules.portscan.banner_bytes.max(1);
 
@@ -475,14 +481,15 @@ async fn scan_port(
 
     // Send a protocol-appropriate probe, if any.
     let probe = probe_for_port(port);
-    if !probe.is_empty()
-        && let Err(e) = timeout(PROBE_WRITE_TIMEOUT, stream.write_all(probe)).await
-    {
-        debug!("port {} probe write error: {}", port, e);
+    if !probe.is_empty() {
+        if let Err(e) = timeout(PROBE_WRITE_TIMEOUT, stream.write_all(probe)).await {
+            debug!("port {} probe write error: {}", port, e);
+        }
     }
 
-    // Try to read a response. A reset here is treated as a likely false
-    // positive from a stateful firewall/proxy and the port is discarded.
+    // Try to read a response. A reset here is usually a false positive from a
+    // stateful firewall/proxy, but TLS-first services send TLS alerts to plain
+    // text probes, so those ports must still be reported as open.
     let mut buf = vec![0u8; banner_bytes];
     match timeout(BANNER_READ_TIMEOUT, stream.read(&mut buf)).await {
         Ok(Ok(n)) => {
@@ -495,17 +502,29 @@ async fn scan_port(
             }
         }
         Ok(Err(e)) => {
-            debug!(
-                "port {} banner read error (discarding false positive): {}",
-                port, e
-            );
-            None
+            if is_tls_first_port(port) {
+                debug!(
+                    "port {} banner read error on TLS-first port (reporting open): {}",
+                    port, e
+                );
+                Some((port, String::new()))
+            } else {
+                debug!(
+                    "port {} banner read error (discarding false positive): {}",
+                    port, e
+                );
+                None
+            }
         }
         Err(_) => {
             // Open but no banner within the read window.
             Some((port, String::new()))
         }
     }
+}
+
+fn is_tls_first_port(port: u16) -> bool {
+    matches!(port, 443 | 465 | 636 | 993 | 995 | 8443 | 9001 | 9443)
 }
 
 fn probe_for_port(port: u16) -> &'static [u8] {
@@ -757,12 +776,10 @@ mod tests {
             .iter()
             .find(|f| f.title == "Port scan summary")
             .expect("summary missing");
-        assert!(
-            summary
-                .evidence
-                .iter()
-                .any(|e| e.contains(&port.to_string()))
-        );
+        assert!(summary
+            .evidence
+            .iter()
+            .any(|e| e.contains(&port.to_string())));
 
         let individual = findings
             .iter()

@@ -1,11 +1,11 @@
 mod common;
 
-use common::{TestServer, find_finding, test_config, wait_for_server};
+use common::{find_finding, test_config, wait_for_server, TestServer};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use tempfile::TempDir;
 use wasp::finding::Severity;
-use wasp::modules::{Module, nuclei::Nuclei};
+use wasp::modules::{nuclei::Nuclei, Module};
 use wasp::target::Target;
 
 /// Create a fake nuclei binary that emits one JSON-line finding for the

@@ -1,14 +1,14 @@
 mod common;
 
-use common::{TestServer, find_finding, test_config, wait_for_server};
+use common::{find_finding, test_config, wait_for_server, TestServer};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use tempfile::TempDir;
 use tokio::process::Command;
-use tokio::time::{Duration, timeout};
+use tokio::time::{timeout, Duration};
 use wasp::finding::Severity;
-use wasp::modules::{Module, nmap::Nmap};
+use wasp::modules::{nmap::Nmap, Module};
 use wasp::target::Target;
 
 /// Create a fake nmap binary that emits XML with a single open port.
@@ -78,12 +78,10 @@ async fn nmap_module_detects_open_port_from_xml() {
     )
     .expect("missing open-port finding");
     assert_eq!(port_finding.severity, Severity::Info);
-    assert!(
-        port_finding
-            .evidence
-            .iter()
-            .any(|e| e.contains("fake-server"))
-    );
+    assert!(port_finding
+        .evidence
+        .iter()
+        .any(|e| e.contains("fake-server")));
 }
 
 #[tokio::test]

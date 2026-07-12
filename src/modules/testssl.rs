@@ -4,7 +4,6 @@ use crate::modules::Module;
 use crate::target::Target;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::Utc;
 use log::{debug, warn};
 use serde::Deserialize;
 use std::process::Stdio;
@@ -29,7 +28,7 @@ impl Module for Testssl {
 
         debug!("running testssl.sh against {}", host_arg);
 
-        let tmp_path = temp_json_path();
+        let (tmp_file, tmp_path) = temp_json_path()?;
         let mut cmd = Command::new(&config.tools.testssl_path);
         cmd.arg("--jsonfile-pretty")
             .arg(&tmp_path)
@@ -46,18 +45,16 @@ impl Module for Testssl {
                     "testssl.sh binary not found at {:?}, skipping",
                     config.tools.testssl_path
                 );
-                return Ok(vec![
-                    Finding::new(
-                        "testssl",
-                        "testssl.sh unavailable",
-                        Severity::Info,
-                        "The configured testssl.sh binary could not be found.",
-                    )
-                    .with_evidence(format!("path: {:?}", config.tools.testssl_path))
-                    .with_remediation(
-                        "Install testssl.sh or update tools.testssl_path in the configuration.",
-                    ),
-                ]);
+                return Ok(vec![Finding::new(
+                    "testssl",
+                    "testssl.sh unavailable",
+                    Severity::Info,
+                    "The configured testssl.sh binary could not be found.",
+                )
+                .with_evidence(format!("path: {:?}", config.tools.testssl_path))
+                .with_remediation(
+                    "Install testssl.sh or update tools.testssl_path in the configuration.",
+                )]);
             }
             Err(e) => return Err(e.into()),
         };
@@ -98,7 +95,7 @@ impl Module for Testssl {
         }
         .await;
 
-        let _ = tokio::fs::remove_file(&tmp_path).await;
+        let _ = tmp_file.close();
         result
     }
 }
@@ -250,12 +247,13 @@ fn parse_testssl_json(json: &str) -> Result<Vec<Finding>> {
     Ok(findings)
 }
 
-fn temp_json_path() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "wasp-testssl-{}-{}.json",
-        std::process::id(),
-        Utc::now().timestamp_millis()
-    ))
+fn temp_json_path() -> Result<(tempfile::NamedTempFile, std::path::PathBuf)> {
+    let tmp = tempfile::Builder::new()
+        .suffix(".json")
+        .tempfile()
+        .context("failed to create temporary file for testssl.sh output")?;
+    let path = tmp.path().to_path_buf();
+    Ok((tmp, path))
 }
 
 #[cfg(test)]
@@ -301,16 +299,12 @@ mod tests {
         let findings = parse_testssl_json(SAMPLE_JSON).unwrap();
         // sslv2 OK excluded, service INFO excluded, plus summary = 5
         assert_eq!(findings.len(), 6);
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.title == "TLS issue: sslv3" && f.severity == Severity::High)
-        );
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.title == "TLS issue: heartbleed" && f.severity == Severity::Critical)
-        );
+        assert!(findings
+            .iter()
+            .any(|f| f.title == "TLS issue: sslv3" && f.severity == Severity::High));
+        assert!(findings
+            .iter()
+            .any(|f| f.title == "TLS issue: heartbleed" && f.severity == Severity::Critical));
         assert!(findings.iter().any(|f| f.title == "TLS/SSL scan summary"));
     }
 
@@ -372,16 +366,12 @@ EOF
         let module = Testssl;
         let findings = module.run(&target, &config).await.unwrap();
 
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.title == "TLS issue: tls1 1" && f.severity == Severity::Medium)
-        );
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.title == "TLS issue: sweet32" && f.severity == Severity::Low)
-        );
+        assert!(findings
+            .iter()
+            .any(|f| f.title == "TLS issue: tls1 1" && f.severity == Severity::Medium));
+        assert!(findings
+            .iter()
+            .any(|f| f.title == "TLS issue: sweet32" && f.severity == Severity::Low));
         assert!(findings.iter().any(|f| f.title == "TLS/SSL scan summary"));
     }
 }

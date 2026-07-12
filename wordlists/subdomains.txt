@@ -21,7 +21,6 @@ staging
 beta
 app
 mobile
-ftp
 cdn
 static
 media

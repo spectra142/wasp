@@ -4,12 +4,13 @@ use crate::config::Config;
 use crate::finding::{Finding, Severity};
 use crate::modules::Module;
 use crate::target::Target;
+use crate::tls;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use log::debug;
 use rustls::pki_types::{CertificateDer, ServerName};
-use rustls::{CipherSuite, ClientConfig, version};
+use rustls::{version, CipherSuite};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -39,18 +40,16 @@ impl Module for TlsAudit {
 
         if !is_port_reachable(&addr, dur).await {
             debug!("TLS audit: {} is not reachable", addr);
-            return Ok(vec![
-                Finding::new(
-                    "tlsaudit",
-                    "TLS service unreachable",
-                    Severity::Info,
-                    "Could not establish a TCP connection to the TLS port",
-                )
-                .with_evidence(format!("Target: {}", addr))
-                .with_remediation(
-                    "Ensure the target is reachable and TLS is enabled on the expected port.",
-                ),
-            ]);
+            return Ok(vec![Finding::new(
+                "tlsaudit",
+                "TLS service unreachable",
+                Severity::Info,
+                "Could not establish a TCP connection to the TLS port",
+            )
+            .with_evidence(format!("Target: {}", addr))
+            .with_remediation(
+                "Ensure the target is reachable and TLS is enabled on the expected port.",
+            )]);
         }
 
         let mut findings = Vec::new();
@@ -499,7 +498,6 @@ struct CipherInfo {
 enum CipherStrength {
     Strong,
     Weak,
-    Unknown,
 }
 
 async fn probe_cipher(
@@ -539,7 +537,10 @@ fn classify_cipher(suite: CipherSuite) -> CipherStrength {
         | CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
         | CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
         | CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 => CipherStrength::Strong,
-        _ => CipherStrength::Unknown,
+        // Treat any other negotiated cipher as weak. This is intentionally
+        // conservative for a security scanner: CBC-only, RSA key exchange,
+        // RC4, 3DES, export ciphers, and unknown suites are all reported.
+        _ => CipherStrength::Weak,
     }
 }
 
@@ -863,61 +864,7 @@ fn build_connector(
     provider: rustls::crypto::CryptoProvider,
     versions: &[&'static rustls::SupportedProtocolVersion],
 ) -> Result<TlsConnector> {
-    let config = ClientConfig::builder_with_provider(Arc::new(provider))
-        .with_protocol_versions(versions)?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerifier))
-        .with_no_client_auth();
-    Ok(TlsConnector::from(Arc::new(config)))
-}
-
-#[derive(Debug)]
-struct NoVerifier;
-
-impl rustls::client::danger::ServerCertVerifier for NoVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
-            rustls::SignatureScheme::ED25519,
-        ]
-    }
+    tls::build_unverified_connector_with_provider(provider, versions)
 }
 
 #[cfg(test)]
@@ -962,6 +909,22 @@ mod tests {
         assert_eq!(
             classify_cipher(CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384),
             CipherStrength::Strong
+        );
+    }
+
+    #[test]
+    fn classifies_unknown_and_legacy_ciphers_as_weak() {
+        // RSA key exchange with AES-CBC is not forward-secret and should be
+        // reported as weak.
+        assert_eq!(
+            classify_cipher(CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA),
+            CipherStrength::Weak
+        );
+        // Any suite rustls does not explicitly recognize as strong is treated
+        // as weak so the finding is never silently dropped.
+        assert_eq!(
+            classify_cipher(CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV),
+            CipherStrength::Weak
         );
     }
 

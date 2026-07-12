@@ -89,9 +89,18 @@ fn information_uri() -> Option<String> {
     }
 }
 
+fn slugify(title: &str) -> String {
+    title
+        .to_ascii_lowercase()
+        .replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '_', "-")
+        .replace("--", "-")
+        .trim_matches('-')
+        .to_string()
+}
+
 fn finding_to_result(finding: &Finding, target: &str) -> SarifResult {
     SarifResult {
-        rule_id: finding.module.clone(),
+        rule_id: format!("{}/{}", finding.module, slugify(&finding.title)),
         message: Message {
             text: format!("{}: {}", finding.title, finding.description),
         },
@@ -148,16 +157,14 @@ mod tests {
 
     fn sample_report() -> Report {
         let mut report = Report::new("example.com:443");
-        report.add_findings(vec![
-            Finding::new(
-                "web",
-                "Missing HSTS header",
-                Severity::High,
-                "The server does not send an HSTS header.",
-            )
-            .with_evidence("Strict-Transport-Security: absent")
-            .with_remediation("Enable HSTS."),
-        ]);
+        report.add_findings(vec![Finding::new(
+            "web",
+            "Missing HSTS header",
+            Severity::High,
+            "The server does not send an HSTS header.",
+        )
+        .with_evidence("Strict-Transport-Security: absent")
+        .with_remediation("Enable HSTS.")]);
         report.finalize();
         report
     }
@@ -183,14 +190,12 @@ mod tests {
 
         let results = runs[0]["results"].as_array().unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0]["ruleId"], "web");
+        assert_eq!(results[0]["ruleId"], "web/missing-hsts-header");
         assert_eq!(results[0]["level"], "error");
-        assert!(
-            results[0]["message"]["text"]
-                .as_str()
-                .unwrap()
-                .contains("Missing HSTS header")
-        );
+        assert!(results[0]["message"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Missing HSTS header"));
         assert_eq!(
             results[0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
             "example.com:443"

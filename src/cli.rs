@@ -11,6 +11,7 @@ const ANSI_GRAY: &str = "\x1b[90m";
 #[derive(Parser, Debug)]
 #[command(
     name = "wasp",
+    version,
     about = "Web Attack Surface Profiler",
     long_about = "WASP is a modular security reconnaissance scanner. Only scan targets you own or have explicit permission to test."
 )]
@@ -31,7 +32,7 @@ pub struct Args {
     #[arg(short, long)]
     pub config: Option<PathBuf>,
 
-    /// Maximum concurrent requests/connections
+    /// Global concurrency limit (maximum simultaneous connections/module tasks)
     #[arg(short, long)]
     pub rate: Option<usize>,
 

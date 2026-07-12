@@ -1,7 +1,7 @@
 mod common;
 
-use common::{TestServer, find_finding, test_config, wait_for_server};
-use wasp::modules::{Module, portscan::Portscan};
+use common::{find_finding, test_config, wait_for_server, TestServer};
+use wasp::modules::{portscan::Portscan, Module};
 use wasp::scanner::Scanner;
 use wasp::target::Target;
 

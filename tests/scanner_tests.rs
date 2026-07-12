@@ -1,6 +1,6 @@
 mod common;
 
-use common::{TestServer, temp_wordlist, test_config, wait_for_server};
+use common::{temp_wordlist, test_config, wait_for_server, TestServer};
 use wasp::scanner::Scanner;
 use wasp::target::Target;
 

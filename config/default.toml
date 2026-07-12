@@ -5,10 +5,15 @@ user_agent = "WASP/0.1.0"
 follow_redirects = true
 max_redirects = 10
 verify_tls_certificates = true
+http_proxy = ""
+https_proxy = ""
+custom_headers = {}
 
 [modules.recon]
 enabled = true
 subdomain_wordlist = "wordlists/subdomains.txt"
+check_http = true
+check_https = true
 enable_whois = true
 enable_dns = true
 enable_subdomain_bruteforce = true
@@ -31,6 +36,8 @@ check_tls_cert = true
 [modules.secrets]
 enabled = true
 path_wordlist = "wordlists/exposed_paths.txt"
+check_http = true
+check_https = true
 enable_body_regex = true
 
 [modules.tlsaudit]
@@ -41,6 +48,8 @@ check_certificate = true
 
 [modules.webvulns]
 enabled = true
+check_http = true
+check_https = true
 check_cors = true
 check_open_redirect = true
 check_trace = true
@@ -52,15 +61,21 @@ enabled = false
 
 [modules.nuclei]
 enabled = false
+check_http = true
+check_https = true
 
 [modules.testssl]
 enabled = false
 
 [modules.cms]
 enabled = false
+check_http = true
+check_https = true
 
 [modules.cmsenum]
 enabled = true
+check_http = true
+check_https = true
 
 [tools]
 nmap_path = "nmap"

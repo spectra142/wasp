@@ -1,8 +1,8 @@
 mod common;
 
-use common::{TestServer, find_finding, temp_wordlist, test_config, wait_for_server};
+use common::{find_finding, temp_wordlist, test_config, wait_for_server, TestServer};
 use wasp::finding::Severity;
-use wasp::modules::{Module, secrets::Secrets};
+use wasp::modules::{secrets::Secrets, Module};
 use wasp::target::Target;
 
 #[tokio::test]
@@ -40,12 +40,10 @@ async fn secrets_module_detects_aws_key_leak() {
     let finding = find_finding(&findings, "secrets", "AWS Access Key ID")
         .expect("missing AWS key leak finding");
     assert_eq!(finding.severity, Severity::High);
-    assert!(
-        finding
-            .evidence
-            .iter()
-            .any(|e| e.contains("AKIAIOSFODNN7EXAMPLE"))
-    );
+    assert!(finding
+        .evidence
+        .iter()
+        .any(|e| e.contains("AKIAIOSFODNN7EXAMPLE")));
 }
 
 #[tokio::test]

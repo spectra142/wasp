@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::finding::{Finding, Severity};
-use crate::modules::Module;
 use crate::modules::external::{run_tool, tool_available};
+use crate::modules::Module;
 use crate::target::Target;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -27,15 +27,13 @@ impl Module for Nmap {
         if !tool_available(nmap_path).await {
             if config.tools.skip_missing_tools {
                 debug!("nmap not available at {:?}, skipping", nmap_path);
-                return Ok(vec![
-                    Finding::new(
-                        "nmap",
-                        "nmap unavailable",
-                        Severity::Info,
-                        "The configured nmap binary could not be found on the system",
-                    )
-                    .with_evidence(format!("nmap_path: {:?}", nmap_path)),
-                ]);
+                return Ok(vec![Finding::new(
+                    "nmap",
+                    "nmap unavailable",
+                    Severity::Info,
+                    "The configured nmap binary could not be found on the system",
+                )
+                .with_evidence(format!("nmap_path: {:?}", nmap_path))]);
             }
             anyhow::bail!("nmap not found at {:?}", nmap_path);
         }
@@ -43,7 +41,17 @@ impl Module for Nmap {
         let host = target.host();
         let top_ports = config.modules.portscan.top_ports.clamp(1, 65535);
         let top_ports_str = top_ports.to_string();
-        let args = vec!["-oX", "-", "-sV", "--top-ports", &top_ports_str, &host];
+        // -Pn treats the host as up so the scan proceeds even when ICMP/ping is
+        // filtered, which is common in proxy/TOR/VPN and hardened environments.
+        let args = vec![
+            "-oX",
+            "-",
+            "-Pn",
+            "-sV",
+            "--top-ports",
+            &top_ports_str,
+            &host,
+        ];
 
         let output = run_tool(
             nmap_path,
@@ -124,11 +132,11 @@ fn parse_nmap_xml(xml: &str, host: &str) -> Result<Vec<Finding>> {
     let mut open_ports: Vec<String> = Vec::new();
 
     for host_entry in &run.hosts {
-        if let Some(status) = &host_entry.status
-            && status.state != "up"
-        {
-            debug!("nmap reports host {} as {}", host, status.state);
-            continue;
+        if let Some(status) = &host_entry.status {
+            if status.state != "up" {
+                debug!("nmap reports host {} as {}", host, status.state);
+                continue;
+            }
         }
 
         if let Some(ports) = &host_entry.ports {
@@ -240,24 +248,18 @@ mod tests {
 
         let summary = &findings[0];
         assert_eq!(summary.title, "Nmap port scan summary");
-        assert!(
-            summary
-                .evidence
-                .iter()
-                .any(|e| e.contains("22/tcp") && e.contains("80/tcp"))
-        );
+        assert!(summary
+            .evidence
+            .iter()
+            .any(|e| e.contains("22/tcp") && e.contains("80/tcp")));
 
         let titles: Vec<&str> = findings.iter().map(|f| f.title.as_str()).collect();
-        assert!(
-            titles
-                .iter()
-                .any(|t| t.contains("22/tcp") && t.contains("ssh"))
-        );
-        assert!(
-            titles
-                .iter()
-                .any(|t| t.contains("80/tcp") && t.contains("http"))
-        );
+        assert!(titles
+            .iter()
+            .any(|t| t.contains("22/tcp") && t.contains("ssh")));
+        assert!(titles
+            .iter()
+            .any(|t| t.contains("80/tcp") && t.contains("http")));
         assert!(!titles.iter().any(|t| t.contains("443/tcp")));
 
         let ssh = findings

@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use wasp::config::Config;
-use wasp::modules::Module;
 use wasp::modules::cmsenum::CmsEnum;
+use wasp::modules::Module;
 use wasp::target::Target;
 
 #[derive(Clone)]

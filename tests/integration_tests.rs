@@ -1,7 +1,7 @@
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use wasp::config::Config;
-use wasp::modules::{Module, portscan::Portscan, secrets::Secrets, web::Web};
+use wasp::modules::{portscan::Portscan, secrets::Secrets, web::Web, Module};
 use wasp::target::Target;
 
 async fn start_test_server() -> u16 {

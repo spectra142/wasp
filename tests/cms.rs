@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use wasp::{config::Config, modules::Module, modules::cms::Cms, target::Target};
+use wasp::{config::Config, modules::cms::Cms, modules::Module, target::Target};
 
 #[tokio::test]
 async fn detects_wordpress_via_generator_tag_and_missing_wpscan_is_reported() {

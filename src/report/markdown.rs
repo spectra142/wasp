@@ -100,16 +100,14 @@ mod tests {
 
     fn sample_report() -> Report {
         let mut report = Report::new("example.com:443");
-        report.add_findings(vec![
-            Finding::new(
-                "web",
-                "Missing HSTS header",
-                Severity::High,
-                "The server does not send an HSTS header.",
-            )
-            .with_evidence("Strict-Transport-Security: absent")
-            .with_remediation("Enable HSTS."),
-        ]);
+        report.add_findings(vec![Finding::new(
+            "web",
+            "Missing HSTS header",
+            Severity::High,
+            "The server does not send an HSTS header.",
+        )
+        .with_evidence("Strict-Transport-Security: absent")
+        .with_remediation("Enable HSTS.")]);
         report.finalize();
         report
     }

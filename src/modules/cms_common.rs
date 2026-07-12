@@ -308,7 +308,7 @@ pub async fn probe_joomla(client: &Client, base: &str, indicators: &mut Vec<Indi
 
 pub fn build_client(config: &Config) -> Result<Client> {
     config
-        .http_client_builder()
+        .http_client_builder()?
         .build()
         .context("failed to build HTTP client for CMS scanner")
 }

@@ -27,10 +27,10 @@ impl Module for Nuclei {
         let mut findings = Vec::new();
         let mut schemes = Vec::new();
 
-        if config.modules.web.check_http {
+        if config.modules.nuclei.check_http {
             schemes.push("http");
         }
-        if config.modules.web.check_https {
+        if config.modules.nuclei.check_https {
             schemes.push("https");
         }
 
@@ -237,12 +237,10 @@ mod tests {
         assert_eq!(finding.title, "Remote Code Execution");
         assert_eq!(finding.severity, Severity::Critical);
         assert_eq!(finding.description, "RCE via unsafe deserialization");
-        assert!(
-            finding
-                .evidence
-                .iter()
-                .any(|e| e.contains("https://example.com"))
-        );
+        assert!(finding
+            .evidence
+            .iter()
+            .any(|e| e.contains("https://example.com")));
         assert!(finding.evidence.iter().any(|e| e.contains("CVE-2024-1234")));
         assert!(finding.evidence.iter().any(|e| e.contains("/admin")));
         assert!(finding.evidence.iter().any(|e| e.contains("admin")));

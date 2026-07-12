@@ -12,9 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use trust_dns_resolver::TokioAsyncResolver;
 use trust_dns_resolver::config::{ResolverConfig, ResolverOpts};
 use trust_dns_resolver::proto::rr::RecordType;
+use trust_dns_resolver::TokioAsyncResolver;
 use url::Host;
 
 pub struct Recon;
@@ -142,7 +142,7 @@ async fn dns_records(target: &Target, config: &Config) -> Result<Vec<Finding>> {
     Ok(findings)
 }
 
-async fn whois(target: &Target, _config: &Config) -> Result<Vec<Finding>> {
+async fn whois(target: &Target, config: &Config) -> Result<Vec<Finding>> {
     let mut findings = Vec::new();
 
     let domain = match &target.host {
@@ -153,42 +153,130 @@ async fn whois(target: &Target, _config: &Config) -> Result<Vec<Finding>> {
         }
     };
 
-    match timeout(
-        Duration::from_secs(5),
-        TcpStream::connect("whois.iana.org:43"),
-    )
-    .await
-    {
-        Ok(Ok(mut stream)) => {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            if let Err(e) = stream.write_all(format!("{}\r\n", domain).as_bytes()).await {
-                warn!("WHOIS write failed: {}", e);
-                return Ok(findings);
-            }
-            let mut buf = vec![0u8; 8192];
-            match timeout(Duration::from_secs(5), stream.read(&mut buf)).await {
-                Ok(Ok(n)) if n > 0 => {
-                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
-                    if !text.trim().is_empty() {
-                        findings.push(
-                            Finding::new(
-                                "recon",
-                                "WHOIS record retrieved",
-                                Severity::Info,
-                                &format!("WHOIS data for {} via IANA", domain),
-                            )
-                            .with_evidence(text.lines().take(10).collect::<Vec<_>>().join("\n")),
-                        );
-                    }
-                }
-                _ => {}
-            }
+    let dur = config.timeout();
+    let iana_text = query_whois_server("whois.iana.org:43", &domain, dur).await;
+    if iana_text.trim().is_empty() {
+        debug!("IANA WHOIS returned no data for {}", domain);
+        return Ok(findings);
+    }
+
+    // IANA returns a referral to the authoritative WHOIS server. Follow it once
+    // to obtain the actual registration record.
+    let text = if let Some(referral) = extract_whois_referral(&iana_text) {
+        debug!("WHOIS referral for {}: {}", domain, referral);
+        let referral_text = query_whois_server(&referral, &domain, dur).await;
+        if referral_text.trim().is_empty() {
+            iana_text
+        } else {
+            referral_text
         }
-        Ok(Err(e)) => debug!("WHOIS connection failed: {}", e),
-        Err(_) => debug!("WHOIS connection timed out"),
+    } else {
+        iana_text
+    };
+
+    if !text.trim().is_empty() {
+        findings.push(
+            Finding::new(
+                "recon",
+                "WHOIS record retrieved",
+                Severity::Info,
+                &format!("WHOIS data for {}", domain),
+            )
+            .with_evidence(text.lines().take(10).collect::<Vec<_>>().join("\n")),
+        );
     }
 
     Ok(findings)
+}
+
+async fn query_whois_server(server: &str, domain: &str, dur: Duration) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    match timeout(dur, TcpStream::connect(server)).await {
+        Ok(Ok(mut stream)) => {
+            if let Err(e) = stream.write_all(format!("{}\r\n", domain).as_bytes()).await {
+                warn!("WHOIS write to {} failed: {}", server, e);
+                return String::new();
+            }
+            let mut buf = vec![0u8; 8192];
+            match timeout(dur, stream.read(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => String::from_utf8_lossy(&buf[..n]).to_string(),
+                _ => String::new(),
+            }
+        }
+        Ok(Err(e)) => {
+            debug!("WHOIS connection to {} failed: {}", server, e);
+            String::new()
+        }
+        Err(_) => {
+            debug!("WHOIS connection to {} timed out", server);
+            String::new()
+        }
+    }
+}
+
+fn extract_whois_referral(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        let trimmed = lower.trim();
+        if let Some(server) = trimmed
+            .strip_prefix("refer:")
+            .or_else(|| trimmed.strip_prefix("whois server:"))
+            .or_else(|| trimmed.strip_prefix("referralserver:"))
+        {
+            let server = server.trim();
+            // Remove possible whois:// prefix.
+            let server = server.strip_prefix("whois://").unwrap_or(server);
+            // Append default WHOIS port if missing.
+            if server.contains(':') {
+                return Some(server.to_string());
+            }
+            return Some(format!("{}:43", server));
+        }
+    }
+    None
+}
+
+/// Probe a few unlikely subdomains. If they all resolve to the same IP, the
+/// target likely has a wildcard DNS record and brute-force would produce false
+/// positives for every word in the wordlist.
+async fn detect_wildcard_dns(domain: &str, config: &Config) -> Option<String> {
+    let resolver = match resolver() {
+        Ok(r) => Arc::new(r),
+        Err(e) => {
+            debug!("failed to build resolver for wildcard check: {}", e);
+            return None;
+        }
+    };
+    let dur = config.timeout();
+    let pid = std::process::id();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let probes: Vec<String> = (0..3)
+        .map(|i| format!("wasp-wildcard-{}-{}-{}.{}", pid, now, i, domain))
+        .collect();
+
+    let mut first_ip: Option<String> = None;
+    for probe in &probes {
+        match timeout(dur, resolver.lookup_ip(probe)).await {
+            Ok(Ok(ips)) => {
+                let addrs: Vec<String> = ips.iter().map(|ip| ip.to_string()).collect();
+                if addrs.is_empty() {
+                    return None;
+                }
+                let representative = addrs.join(", ");
+                match &first_ip {
+                    None => first_ip = Some(representative),
+                    Some(ip) if *ip == representative => {}
+                    Some(_) => return None,
+                }
+            }
+            _ => return None,
+        }
+    }
+
+    first_ip
 }
 
 async fn subdomain_bruteforce(target: &Target, config: &Config) -> Result<Vec<Finding>> {
@@ -197,6 +285,20 @@ async fn subdomain_bruteforce(target: &Target, config: &Config) -> Result<Vec<Fi
         Host::Domain(d) => d.clone(),
         Host::Ipv4(_) | Host::Ipv6(_) => return Ok(findings),
     };
+
+    if let Some(wildcard) = detect_wildcard_dns(&domain, config).await {
+        findings.push(
+            Finding::new(
+                "recon",
+                &format!("Wildcard DNS detected for {}", domain),
+                Severity::Info,
+                "A wildcard DNS record resolves arbitrary subdomains, making brute-force enumeration unreliable",
+            )
+            .with_evidence(format!("Sample resolved to: {}", wildcard))
+            .with_remediation("Use other enumeration sources or disable subdomain brute-force for wildcard domains."),
+        );
+        return Ok(findings);
+    }
 
     let wordlist_path = &config.modules.recon.subdomain_wordlist;
     let words = match fs::read_to_string(wordlist_path) {
@@ -219,9 +321,15 @@ async fn subdomain_bruteforce(target: &Target, config: &Config) -> Result<Vec<Fi
     }
 
     let resolver = Arc::new(resolver()?);
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(
-        config.scanner.concurrency.max(1),
-    ));
+    let semaphore = config
+        .scanner
+        .concurrency_semaphore
+        .clone()
+        .unwrap_or_else(|| {
+            Arc::new(tokio::sync::Semaphore::new(
+                config.scanner.concurrency.max(1),
+            ))
+        });
     let dur = config.timeout();
     let mut handles = Vec::new();
 
@@ -282,10 +390,10 @@ async fn tech_fingerprint(target: &Target, config: &Config) -> Result<Vec<Findin
 
     let urls: Vec<String> = {
         let mut v = Vec::new();
-        if config.modules.web.check_https {
+        if config.modules.recon.check_https {
             v.push(format!("https://{}/", host));
         }
-        if config.modules.web.check_http {
+        if config.modules.recon.check_http {
             v.push(format!("http://{}/", host));
         }
         v

@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::finding::{Finding, Report, Severity};
-use crate::modules::{Module, enabled_modules};
+use crate::modules::{enabled_modules, Module};
 use crate::target::Target;
 use anyhow::Result;
 use log::{error, info, warn};
@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::sleep;
 
-/// Default maximum number of requests (module invocations) per second for a
-/// single host. This can be tuned with [`Scanner::with_rate_limit`].
+/// Default maximum number of module invocations per second for a single host.
+/// This limits how fast WASP starts new modules, not the requests a module
+/// makes internally. This can be tuned with [`Scanner::with_rate_limit`].
 const DEFAULT_RATE_LIMIT: usize = 100;
 
 /// Default number of retries for module runs that fail with a transient error.
@@ -23,8 +24,8 @@ const DEFAULT_RETRY_DELAY_MS: u64 = 500;
 pub struct Scanner {
     config: Config,
     modules: Vec<Arc<dyn Module>>,
-    /// Maximum requests (module starts) per second per host. `None` disables
-    /// rate limiting.
+    /// Maximum module invocations per second per host. `None` disables rate
+    /// limiting. This does not throttle requests made inside a module.
     rate_limit: Option<usize>,
     /// Maximum retry attempts for transient failures.
     max_retries: usize,
@@ -48,8 +49,8 @@ impl Scanner {
         }
     }
 
-    /// Set a per-host rate limit in requests per second. Pass `None` to disable
-    /// rate limiting.
+    /// Set a per-host rate limit in module invocations per second. Pass `None`
+    /// to disable rate limiting.
     pub fn with_rate_limit(mut self, requests_per_second: Option<usize>) -> Self {
         self.rate_limit = requests_per_second;
         self
@@ -70,7 +71,12 @@ impl Scanner {
 
     pub async fn run(&self, target: &Target) -> Result<Report> {
         let mut report = Report::new(target.to_string());
-        let global_semaphore = Arc::new(Semaphore::new(self.config.scanner.concurrency.max(1)));
+        let global_semaphore = self
+            .config
+            .scanner
+            .concurrency_semaphore
+            .clone()
+            .unwrap_or_else(|| Arc::new(Semaphore::new(self.config.scanner.concurrency.max(1))));
         let host = target.host();
         let rate_limiter = self.rate_limiter_for_host(&host).await;
 

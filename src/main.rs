@@ -1,7 +1,9 @@
 use clap::Parser;
 use log::info;
 use std::collections::HashSet;
-use wasp::cli::{Args, format_summary};
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+use wasp::cli::{format_summary, Args};
 use wasp::config::Config;
 use wasp::scanner::Scanner;
 use wasp::target::Target;
@@ -19,6 +21,10 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(rate) = args.rate {
         config.scanner.concurrency = rate;
+        // The semaphore was already built inside Config::load with the original
+        // value; rebuild it so -r/--rate actually affects concurrency.
+        config.scanner.concurrency_semaphore =
+            Some(Arc::new(Semaphore::new(config.scanner.concurrency.max(1))));
     }
 
     if args.insecure {
@@ -176,6 +182,7 @@ mod tests {
         assert!(!config.modules.portscan.enabled);
         assert!(!config.modules.secrets.enabled);
         assert!(!config.modules.cms.enabled);
+        assert!(!config.modules.cmsenum.enabled);
         assert!(!config.modules.nmap.enabled);
         assert!(!config.modules.nuclei.enabled);
         assert!(!config.modules.testssl.enabled);

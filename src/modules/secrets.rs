@@ -56,11 +56,17 @@ impl Module for Secrets {
 
         let secret_patterns = secret_patterns();
         let endpoint_regexes = endpoint_extraction_regexes();
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(
-            config.scanner.concurrency.max(1),
-        ));
-        let check_https = config.modules.web.check_https;
-        let check_http = config.modules.web.check_http;
+        let semaphore = config
+            .scanner
+            .concurrency_semaphore
+            .clone()
+            .unwrap_or_else(|| {
+                Arc::new(tokio::sync::Semaphore::new(
+                    config.scanner.concurrency.max(1),
+                ))
+            });
+        let check_https = config.modules.secrets.check_https;
+        let check_http = config.modules.secrets.check_http;
         let enable_body_regex = config.modules.secrets.enable_body_regex;
         let mut handles = Vec::new();
 

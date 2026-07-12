@@ -2,8 +2,8 @@
 
 use crate::config::Config;
 use crate::finding::{Finding, Severity};
-use crate::modules::Module;
 use crate::modules::cms_common::{self, CmsKind, HttpResponse};
+use crate::modules::Module;
 use crate::target::Target;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -42,10 +42,10 @@ impl Module for CmsEnum {
         let mut findings = Vec::new();
 
         let mut schemes = Vec::new();
-        if config.modules.web.check_https {
+        if config.modules.cmsenum.check_https {
             schemes.push("https");
         }
-        if config.modules.web.check_http {
+        if config.modules.cmsenum.check_http {
             schemes.push("http");
         }
         if schemes.is_empty() {

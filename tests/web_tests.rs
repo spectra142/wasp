@@ -1,8 +1,8 @@
 mod common;
 
-use common::{TestServer, find_finding, test_config, wait_for_server};
+use common::{find_finding, test_config, wait_for_server, TestServer};
 use wasp::finding::Severity;
-use wasp::modules::{Module, web::Web};
+use wasp::modules::{web::Web, Module};
 use wasp::target::Target;
 
 #[tokio::test]
@@ -42,12 +42,10 @@ async fn web_module_reports_server_banner() {
     let finding = find_finding(&findings, "web", "Server banner disclosed")
         .expect("server banner finding missing");
     assert_eq!(finding.severity, Severity::Low);
-    assert!(
-        finding
-            .evidence
-            .iter()
-            .any(|e| e.contains("test-server/1.0"))
-    );
+    assert!(finding
+        .evidence
+        .iter()
+        .any(|e| e.contains("test-server/1.0")));
 }
 
 #[tokio::test]

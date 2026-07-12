@@ -33,10 +33,10 @@ impl Module for WebVulns {
         let client = build_client(config)?;
 
         let mut bases = Vec::new();
-        if config.modules.web.check_http {
+        if cfg.check_http {
             bases.push(format!("http://{}/", host));
         }
-        if config.modules.web.check_https {
+        if cfg.check_https {
             bases.push(format!("https://{}/", host));
         }
         if bases.is_empty() {
@@ -69,9 +69,15 @@ impl Module for WebVulns {
 
         if cfg.check_sensitive_files {
             let paths = sensitive_path_wordlist();
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(
-                config.scanner.concurrency.max(1),
-            ));
+            let semaphore = config
+                .scanner
+                .concurrency_semaphore
+                .clone()
+                .unwrap_or_else(|| {
+                    Arc::new(tokio::sync::Semaphore::new(
+                        config.scanner.concurrency.max(1),
+                    ))
+                });
             let mut handles = Vec::new();
 
             for base in &bases {
@@ -108,7 +114,7 @@ impl Module for WebVulns {
 
 fn build_client(config: &Config) -> Result<Client> {
     config
-        .http_client_builder()
+        .http_client_builder()?
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(Into::into)

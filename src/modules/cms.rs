@@ -2,8 +2,8 @@
 
 use crate::config::Config;
 use crate::finding::{Finding, Severity};
-use crate::modules::Module;
 use crate::modules::cms_common::{self, CmsKind};
+use crate::modules::Module;
 use crate::target::Target;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -34,10 +34,10 @@ impl Module for Cms {
         let host = target.to_string();
 
         let mut schemes = Vec::new();
-        if config.modules.web.check_https {
+        if config.modules.cms.check_https {
             schemes.push("https");
         }
-        if config.modules.web.check_http {
+        if config.modules.cms.check_http {
             schemes.push("http");
         }
         if schemes.is_empty() {
@@ -113,18 +113,16 @@ async fn run_wpscan(url: &str, path: &Path, config: &Config) -> Result<Vec<Findi
         Ok(Err(e)) => {
             if e.kind() == std::io::ErrorKind::NotFound && config.tools.skip_missing_tools {
                 debug!("[cms] WPScan binary not found at {}", path.display());
-                return Ok(vec![
-                    Finding::new(
-                        "cms",
-                        "WPScan unavailable",
-                        Severity::Info,
-                        "WordPress was detected but WPScan could not be executed",
-                    )
-                    .with_evidence(format!("Error: {}", e))
-                    .with_remediation(
-                        "Install WPScan or verify the configured wpscan_path in the config file.",
-                    ),
-                ]);
+                return Ok(vec![Finding::new(
+                    "cms",
+                    "WPScan unavailable",
+                    Severity::Info,
+                    "WordPress was detected but WPScan could not be executed",
+                )
+                .with_evidence(format!("Error: {}", e))
+                .with_remediation(
+                    "Install WPScan or verify the configured wpscan_path in the config file.",
+                )]);
             }
             return Err(e).with_context(|| format!("failed to run WPScan at {}", path.display()));
         }
@@ -133,21 +131,19 @@ async fn run_wpscan(url: &str, path: &Path, config: &Config) -> Result<Vec<Findi
                 "[cms] WPScan timed out after {:?}",
                 Duration::from_secs(config.tools.wpscan_timeout_secs)
             );
-            return Ok(vec![
-                Finding::new(
-                    "cms",
-                    "WPScan timed out",
-                    Severity::Info,
-                    "WPScan did not complete within the configured timeout",
-                )
-                .with_evidence(format!(
-                    "Timeout: {:?}",
-                    Duration::from_secs(config.tools.wpscan_timeout_secs)
-                ))
-                .with_remediation(
-                    "Increase tools.wpscan_timeout_secs or run WPScan manually for deeper analysis.",
-                ),
-            ]);
+            return Ok(vec![Finding::new(
+                "cms",
+                "WPScan timed out",
+                Severity::Info,
+                "WPScan did not complete within the configured timeout",
+            )
+            .with_evidence(format!(
+                "Timeout: {:?}",
+                Duration::from_secs(config.tools.wpscan_timeout_secs)
+            ))
+            .with_remediation(
+                "Increase tools.wpscan_timeout_secs or run WPScan manually for deeper analysis.",
+            )]);
         }
     };
 
@@ -161,16 +157,16 @@ async fn run_wpscan(url: &str, path: &Path, config: &Config) -> Result<Vec<Findi
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     if stdout.trim().is_empty() {
-        return Ok(vec![
-            Finding::new(
-                "cms",
-                "WPScan produced no output",
-                Severity::Info,
-                "WPScan ran but returned no JSON output",
-            )
-            .with_evidence(format!("Exit status: {}", output.status))
-            .with_remediation("Verify WPScan is installed and the target is reachable."),
-        ]);
+        return Ok(vec![Finding::new(
+            "cms",
+            "WPScan produced no output",
+            Severity::Info,
+            "WPScan ran but returned no JSON output",
+        )
+        .with_evidence(format!("Exit status: {}", output.status))
+        .with_remediation(
+            "Verify WPScan is installed and the target is reachable.",
+        )]);
     }
 
     Ok(parse_wpscan_json(&stdout, url))
@@ -181,16 +177,14 @@ fn parse_wpscan_json(json: &str, target_url: &str) -> Vec<Finding> {
         Ok(v) => v,
         Err(e) => {
             warn!("[cms] failed to parse WPScan JSON: {}", e);
-            return vec![
-                Finding::new(
-                    "cms",
-                    "WPScan output is not valid JSON",
-                    Severity::Info,
-                    "WPScan returned output that could not be parsed as JSON",
-                )
-                .with_evidence(format!("Error: {}", e))
-                .with_remediation("Check WPScan installation and command-line arguments."),
-            ];
+            return vec![Finding::new(
+                "cms",
+                "WPScan output is not valid JSON",
+                Severity::Info,
+                "WPScan returned output that could not be parsed as JSON",
+            )
+            .with_evidence(format!("Error: {}", e))
+            .with_remediation("Check WPScan installation and command-line arguments.")];
         }
     };
 
@@ -468,26 +462,18 @@ mod tests {
         assert!(!findings.is_empty());
 
         let titles: Vec<&str> = findings.iter().map(|f| f.title.as_str()).collect();
-        assert!(
-            titles
-                .iter()
-                .any(|t| t.contains("WordPress core - Test Core Vuln"))
-        );
-        assert!(
-            titles
-                .iter()
-                .any(|t| t.contains("WordPress plugin: contact-form-7 - Test Plugin Vuln"))
-        );
-        assert!(
-            titles
-                .iter()
-                .any(|t| t.contains("WordPress theme: twentytwentyfour - Test Theme Vuln"))
-        );
-        assert!(
-            titles
-                .iter()
-                .any(|t| t.contains("WPScan: Directory listing"))
-        );
+        assert!(titles
+            .iter()
+            .any(|t| t.contains("WordPress core - Test Core Vuln")));
+        assert!(titles
+            .iter()
+            .any(|t| t.contains("WordPress plugin: contact-form-7 - Test Plugin Vuln")));
+        assert!(titles
+            .iter()
+            .any(|t| t.contains("WordPress theme: twentytwentyfour - Test Theme Vuln")));
+        assert!(titles
+            .iter()
+            .any(|t| t.contains("WPScan: Directory listing")));
 
         let core = findings
             .iter()

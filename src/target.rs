@@ -27,6 +27,14 @@ impl Target {
             .host()
             .ok_or_else(|| anyhow::anyhow!("invalid target: no host"))?;
         let port = url.port();
+        let path = url.path();
+        if !path.is_empty() && path != "/" {
+            anyhow::bail!(
+                "invalid target '{}': paths are not supported (got '{}'). Provide a host or host:port.",
+                trimmed,
+                path
+            );
+        }
 
         Ok(Self {
             host: host.to_owned(),
@@ -102,11 +110,17 @@ mod tests {
 
     #[test]
     fn parse_url_like_input() {
-        let t = Target::parse("https://example.com:8443/path").unwrap();
+        let t = Target::parse("https://example.com:8443").unwrap();
         assert!(matches!(t.host, Host::Domain(ref d) if d == "example.com"));
         assert_eq!(t.port, Some(8443));
         assert_eq!(t.host(), "example.com");
         assert_eq!(t.address(), "example.com:8443");
+    }
+
+    #[test]
+    fn rejects_url_with_path() {
+        let err = Target::parse("https://example.com:8443/path").unwrap_err();
+        assert!(err.to_string().contains("paths are not supported"));
     }
 
     #[test]

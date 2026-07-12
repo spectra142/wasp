@@ -439,7 +439,7 @@ pub struct TlsServer {
 impl TlsServer {
     pub async fn start() -> Self {
         // Ensure a Rustls crypto provider is installed for the test process.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();

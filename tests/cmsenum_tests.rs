@@ -1,8 +1,8 @@
 mod common;
 
-use common::{CmsTestServer, find_finding, test_config, wait_for_server};
+use common::{find_finding, test_config, wait_for_server, CmsTestServer};
 use wasp::finding::Severity;
-use wasp::modules::{Module, cmsenum::CmsEnum};
+use wasp::modules::{cmsenum::CmsEnum, Module};
 use wasp::target::Target;
 
 #[tokio::test]

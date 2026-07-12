@@ -1,7 +1,7 @@
 [package]
 name = "wasp"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 authors = ["WASP Contributors"]
 description = "Web Attack Surface Profiler - a modular security reconnaissance scanner"
 license = "MIT"
@@ -31,7 +31,7 @@ ipnet = "2"
 async-trait = "0.1"
 quick-xml = { version = "0.37", features = ["serialize"] }
 csv = "1.3"
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 tokio-test = "0.4"
