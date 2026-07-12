@@ -1,0 +1,76 @@
+[scanner]
+concurrency = 100
+timeout_ms = 5000
+user_agent = "WASP/0.1.0"
+follow_redirects = true
+max_redirects = 10
+verify_tls_certificates = true
+
+[modules.recon]
+enabled = true
+subdomain_wordlist = "wordlists/subdomains.txt"
+enable_whois = true
+enable_dns = true
+enable_subdomain_bruteforce = true
+enable_tech_fingerprint = true
+
+[modules.portscan]
+enabled = true
+top_ports = 1000
+banner_grab = true
+banner_bytes = 1024
+
+[modules.web]
+enabled = true
+check_http = true
+check_https = true
+check_headers = true
+check_cookies = true
+check_tls_cert = true
+
+[modules.secrets]
+enabled = true
+path_wordlist = "wordlists/exposed_paths.txt"
+enable_body_regex = true
+
+[modules.tlsaudit]
+enabled = true
+check_versions = true
+check_ciphers = true
+check_certificate = true
+
+[modules.webvulns]
+enabled = true
+check_cors = true
+check_open_redirect = true
+check_trace = true
+check_options = true
+check_sensitive_files = true
+
+[modules.nmap]
+enabled = false
+
+[modules.nuclei]
+enabled = false
+
+[modules.testssl]
+enabled = false
+
+[modules.cms]
+enabled = false
+
+[modules.cmsenum]
+enabled = true
+
+[tools]
+nmap_path = "nmap"
+nuclei_path = "nuclei"
+testssl_path = "testssl.sh"
+wpscan_path = "wpscan"
+gitleaks_path = "gitleaks"
+trufflehog_path = "trufflehog"
+skip_missing_tools = true
+nmap_timeout_secs = 120
+testssl_timeout_secs = 120
+nuclei_timeout_secs = 60
+wpscan_timeout_secs = 120
