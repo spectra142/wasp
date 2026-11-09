@@ -117,8 +117,22 @@ async fn nmap_module_errors_when_binary_missing_and_skip_is_false() {
     );
 }
 
+/// The real-nmap tests exercise the installed binary. They are skipped (with a
+/// note on stderr) when nmap is not on PATH so the suite passes on CI runners
+/// and developer machines without it.
+async fn nmap_installed() -> bool {
+    let found = wasp::modules::external::tool_available(std::path::Path::new("nmap")).await;
+    if !found {
+        eprintln!("skipping: nmap is not installed");
+    }
+    found
+}
+
 #[tokio::test]
 async fn real_nmap_binary_detects_open_port() {
+    if !nmap_installed().await {
+        return;
+    }
     let server = TestServer::start().await;
     wait_for_server(&server.addr(), 1000).await;
 
@@ -162,6 +176,9 @@ async fn real_nmap_binary_detects_open_port() {
 
 #[tokio::test]
 async fn real_nmap_scan_respects_timeout() {
+    if !nmap_installed().await {
+        return;
+    }
     let _config = test_config();
 
     let result = timeout(

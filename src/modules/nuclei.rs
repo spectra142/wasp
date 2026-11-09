@@ -65,8 +65,19 @@ impl Module for Nuclei {
 }
 
 async fn nuclei_available(binary: &std::path::Path, config: &Config) -> bool {
-    let dur = Duration::from_secs(config.tools.nuclei_timeout_secs);
-    match timeout(dur, Command::new(binary).arg("--version").output()).await {
+    if crate::modules::external::resolve_tool(binary).is_none() {
+        return false;
+    }
+    let dur = Duration::from_secs(config.tools.nuclei_timeout_secs.min(30));
+    match timeout(
+        dur,
+        Command::new(binary)
+            .arg("-version")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    {
         Ok(Ok(_)) => true,
         Ok(Err(e)) if e.kind() == io::ErrorKind::NotFound => false,
         Ok(Err(e)) => {
@@ -83,9 +94,17 @@ async fn nuclei_available(binary: &std::path::Path, config: &Config) -> bool {
 async fn run_nuclei_scan(url: &str, config: &Config) -> Result<Vec<Finding>> {
     let binary = &config.tools.nuclei_path;
     let mut cmd = Command::new(binary);
-    cmd.arg("-u").arg(url).arg("-j");
+    // -jsonl: one JSON object per line; -silent/-nc: findings only, no colour;
+    // -duc: never block on the template/engine update check.
+    cmd.arg("-u")
+        .arg(url)
+        .args(["-jsonl", "-silent", "-nc", "-duc"])
+        .kill_on_drop(true);
 
-    debug!("running nuclei scan: {:?} -u {} -j", binary, url);
+    debug!(
+        "running nuclei scan: {:?} -u {} -jsonl -silent -nc -duc",
+        binary, url
+    );
 
     let output = match timeout(
         Duration::from_secs(config.tools.nuclei_timeout_secs),

@@ -25,8 +25,8 @@ This file lists every file in the WASP repository and explains what it does.
 
 | File | Purpose |
 |------|---------|
-| `.github/workflows/ci.yml` | Runs `cargo fmt`, `cargo clippy`, `cargo test`, and release build on every push/PR |
-| `.github/workflows/release.yml` | Builds release binaries for Linux, macOS, and Windows on tags |
+| `.github/workflows/ci.yml` | Runs `cargo fmt`, `cargo clippy`, tests (Linux + macOS), an MSRV check, release builds (Linux + Windows) and a dependency audit on every push/PR |
+| `.github/workflows/release.yml` | Builds release binaries for Linux, macOS (Intel + Apple Silicon) and Windows on tags, with SHA-256 checksums |
 
 ## Source code (`src/`)
 
@@ -37,9 +37,10 @@ This file lists every file in the WASP repository and explains what it does.
 | `src/main.rs` | CLI entry point: parses arguments, loads config, starts the scan, prints summary |
 | `src/lib.rs` | Crate root: exposes public modules and crate-level docs |
 | `src/cli.rs` | clap argument definitions, help text, and summary formatting |
-| `src/config.rs` | Configuration structs, default config embedding, loading, and HTTP client builder |
-| `src/scanner.rs` | `Scanner` orchestrator: runs enabled modules concurrently with retries and rate limiting |
-| `src/finding.rs` | `Finding` and `Report` data model, deduplication, and report writing dispatcher |
+| `src/config.rs` | Configuration structs, embedded defaults and wordlists, merge-over-defaults loading, validation, the shared request limiter, and the HTTP client builder |
+| `src/scanner.rs` | `Scanner` orchestrator: runs enabled modules concurrently with retries and panic isolation |
+| `src/finding.rs` | `Finding`, `Severity` and `Report` data model, deduplication, and secret redaction |
+| `src/http.rs` | Shared HTTP helpers: size-capped body reads and soft-404 (catch-all page) detection |
 | `src/target.rs` | `Target` parsing: domains, IPs, IPv6, ports, URL-like inputs |
 | `src/tls.rs` | Shared TLS helpers: verified and unverified `tokio_rustls` connectors |
 

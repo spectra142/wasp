@@ -70,20 +70,47 @@ pub fn write(report: &Report, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A backtick fence longer than any backtick run inside `content`, so target
+/// controlled evidence can never terminate the code block early.
+fn code_fence(content: &str) -> String {
+    let mut longest = 0;
+    let mut current = 0;
+    for c in content.chars() {
+        if c == '`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    "`".repeat((longest + 1).max(3))
+}
+
+/// Escape characters that would let text break out into raw HTML or links
+/// when the Markdown is rendered.
+fn escape_inline(text: &str) -> String {
+    text.replace('<', "&lt;").replace('>', "&gt;")
+}
+
 fn render_finding(finding: &Finding) -> String {
     let mut s = String::new();
-    s.push_str(&format!("### {} ({})\n\n", finding.title, finding.severity));
+    s.push_str(&format!(
+        "### {} ({})\n\n",
+        escape_inline(&finding.title),
+        finding.severity
+    ));
     s.push_str(&format!("- **Module:** {}\n", finding.module));
     s.push_str(&format!("- **Severity:** {}\n", finding.severity));
     s.push_str(&format!(
         "- **Timestamp:** {}\n\n",
         finding.timestamp.to_rfc3339()
     ));
-    s.push_str(&format!("{}\n\n", finding.description));
+    s.push_str(&format!("{}\n\n", escape_inline(&finding.description)));
     if !finding.evidence.is_empty() {
         s.push_str("#### Evidence\n\n");
         for ev in &finding.evidence {
-            s.push_str(&format!("```\n{}\n```\n\n", ev));
+            let fence = code_fence(ev);
+            s.push_str(&format!("{}text\n{}\n{}\n\n", fence, ev, fence));
         }
     }
     if !finding.remediation.is_empty() {
@@ -126,6 +153,16 @@ mod tests {
         assert!(content.contains("## Findings"));
         assert!(content.contains("Enable HSTS."));
         assert!(content.contains("Critical"));
+    }
+
+    #[test]
+    fn evidence_with_backticks_cannot_escape_fence() {
+        assert_eq!(code_fence("plain"), "```");
+        assert_eq!(code_fence("a ``` b"), "````");
+        let f = Finding::new("x", "<script>", Severity::Low, "d").with_evidence("```\n# injected");
+        let rendered = render_finding(&f);
+        assert!(rendered.contains("````text\n```\n# injected\n````"));
+        assert!(rendered.contains("&lt;script&gt;"));
     }
 
     #[test]

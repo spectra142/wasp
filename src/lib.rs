@@ -3,6 +3,7 @@
 pub mod cli;
 pub mod config;
 pub mod finding;
+pub mod http;
 pub mod modules;
 pub mod report;
 pub mod scanner;

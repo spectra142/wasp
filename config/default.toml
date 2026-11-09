@@ -1,7 +1,8 @@
 [scanner]
 concurrency = 100
 timeout_ms = 5000
-user_agent = "WASP/0.1.0"
+# Leave empty to send "WASP/<version>".
+user_agent = ""
 follow_redirects = true
 max_redirects = 10
 verify_tls_certificates = true

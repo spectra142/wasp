@@ -13,6 +13,17 @@ const CSV_HEADER: &[&str] = &[
     "timestamp",
 ];
 
+/// Neutralise spreadsheet formula injection. Evidence often contains text
+/// controlled by the scanned server (banners, page bodies); a cell starting
+/// with `=`, `+`, `-`, `@`, tab or CR would be executed as a formula when the
+/// CSV is opened in Excel/LibreOffice/Sheets.
+fn safe_cell(value: &str) -> String {
+    match value.chars().next() {
+        Some('=' | '+' | '-' | '@' | '\t' | '\r') => format!("'{}", value),
+        _ => value.to_string(),
+    }
+}
+
 pub fn write(report: &Report, path: &Path) -> Result<()> {
     let mut writer = csv::Writer::from_path(path)
         .with_context(|| format!("failed to create CSV writer for {:?}", path))?;
@@ -24,14 +35,14 @@ pub fn write(report: &Report, path: &Path) -> Result<()> {
     for finding in &report.findings {
         writer
             .write_record([
-                &report.target,
-                &finding.module,
-                &finding.title,
-                &finding.severity.to_string(),
-                &finding.description,
-                &finding.evidence.join("\n"),
-                &finding.remediation,
-                &finding.timestamp.to_rfc3339(),
+                safe_cell(&report.target),
+                safe_cell(&finding.module),
+                safe_cell(&finding.title),
+                finding.severity.to_string(),
+                safe_cell(&finding.description),
+                safe_cell(&finding.evidence.join("\n")),
+                safe_cell(&finding.remediation),
+                finding.timestamp.to_rfc3339(),
             ])
             .context("failed to write CSV row")?;
     }
@@ -75,6 +86,13 @@ mod tests {
         assert!(content.contains("high"));
         assert!(content.contains("Strict-Transport-Security: absent"));
         assert!(content.contains("Enable HSTS."));
+    }
+
+    #[test]
+    fn formula_cells_are_escaped() {
+        assert_eq!(safe_cell("=HYPERLINK(\"x\")"), "'=HYPERLINK(\"x\")");
+        assert_eq!(safe_cell("@SUM(A1)"), "'@SUM(A1)");
+        assert_eq!(safe_cell("normal"), "normal");
     }
 
     #[test]

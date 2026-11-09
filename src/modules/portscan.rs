@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use log::debug;
 use regex::Regex;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -363,26 +363,27 @@ fn parse_port_ranges(s: &str) -> Result<Vec<u16>, std::num::ParseIntError> {
 
 async fn run_portscan(target: &Target, config: &Config, ports: &[u16]) -> Result<Vec<Finding>> {
     let mut findings = Vec::new();
-    let host = target.host();
-    let semaphore = config
-        .scanner
-        .concurrency_semaphore
-        .clone()
-        .unwrap_or_else(|| {
-            Arc::new(tokio::sync::Semaphore::new(
-                config.scanner.concurrency.max(1),
-            ))
-        });
+    // Resolve once up front instead of once per port. Prefer IPv4 when the name
+    // has both address families, matching what most scanners do by default.
+    let addrs = target.resolve(0).await?;
+    let ip: IpAddr = addrs
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or_else(|| addrs.first())
+        .map(|a| a.ip())
+        .ok_or_else(|| anyhow::anyhow!("{} did not resolve", target.host()))?;
+    debug!("portscan: scanning {} ({})", target.host(), ip);
+
+    let semaphore = config.request_limiter();
     let connect_timeout = config.timeout();
     let banner_bytes = config.modules.portscan.banner_bytes.max(1);
 
     let mut handles = Vec::with_capacity(ports.len());
     for &port in ports {
         let permit = semaphore.clone().acquire_owned().await?;
-        let host = host.clone();
         let handle = tokio::spawn(async move {
             let _permit = permit;
-            scan_port(&host, port, connect_timeout, banner_bytes).await
+            scan_port(SocketAddr::new(ip, port), connect_timeout, banner_bytes).await
         });
         handles.push(handle);
     }
@@ -461,13 +462,12 @@ async fn run_portscan(target: &Target, config: &Config, ports: &[u16]) -> Result
 /// filtered, or the connection is reset immediately after establishment
 /// (a common source of false positives).
 async fn scan_port(
-    host: &str,
-    port: u16,
+    addr: SocketAddr,
     connect_timeout: Duration,
     banner_bytes: usize,
 ) -> Option<(u16, String)> {
-    let addr = format!("{}:{}", host, port);
-    let mut stream = match timeout(connect_timeout, TcpStream::connect(&addr)).await {
+    let port = addr.port();
+    let mut stream = match timeout(connect_timeout, TcpStream::connect(addr)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             debug!("port {} connect error: {}", port, e);
@@ -482,8 +482,10 @@ async fn scan_port(
     // Send a protocol-appropriate probe, if any.
     let probe = probe_for_port(port);
     if !probe.is_empty() {
-        if let Err(e) = timeout(PROBE_WRITE_TIMEOUT, stream.write_all(probe)).await {
-            debug!("port {} probe write error: {}", port, e);
+        match timeout(PROBE_WRITE_TIMEOUT, stream.write_all(probe)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => debug!("port {} probe write error: {}", port, e),
+            Err(_) => debug!("port {} probe write timed out", port),
         }
     }
 
@@ -586,6 +588,28 @@ fn sanitize_banner(banner: &str) -> String {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    fn local(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    #[tokio::test]
+    async fn scan_port_works_over_ipv6_loopback() {
+        let listener = match tokio::net::TcpListener::bind("[::1]:0").await {
+            Ok(l) => l,
+            Err(_) => return, // IPv6 unavailable in this environment.
+        };
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = stream.write_all(b"SSH-2.0-OpenSSH_9.6\r\n").await;
+        });
+        let addr = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), port);
+        let (_, banner) = scan_port(addr, Duration::from_secs(2), 256)
+            .await
+            .expect("expected open port on ::1");
+        assert!(banner.contains("SSH-2.0"));
+    }
 
     #[test]
     fn top_1000_list_has_1000_ports() {
@@ -703,7 +727,7 @@ mod tests {
             let _ = stream.write_all(b"SSH-2.0-OpenSSH_8.2\r\n").await;
         });
 
-        let result = scan_port("127.0.0.1", port, Duration::from_secs(2), 256).await;
+        let result = scan_port(local(port), Duration::from_secs(2), 256).await;
         let (found_port, banner) = result.expect("expected open port");
         assert_eq!(found_port, port);
         assert!(banner.contains("SSH-2.0"));
@@ -724,14 +748,14 @@ mod tests {
                 .await;
         });
 
-        let result = scan_port("127.0.0.1", port, Duration::from_secs(2), 256).await;
+        let result = scan_port(local(port), Duration::from_secs(2), 256).await;
         let (_, banner) = result.expect("expected open port");
         assert!(banner.contains("HTTP/1.1"));
     }
 
     #[tokio::test]
     async fn scan_port_returns_none_for_closed_port() {
-        let result = scan_port("127.0.0.1", 1, Duration::from_millis(500), 256).await;
+        let result = scan_port(local(1), Duration::from_millis(500), 256).await;
         assert!(result.is_none());
     }
 
@@ -748,7 +772,7 @@ mod tests {
             }
         });
 
-        let result = scan_port("127.0.0.1", port, Duration::from_secs(2), 256).await;
+        let result = scan_port(local(port), Duration::from_secs(2), 256).await;
         assert!(result.is_none(), "expected reset port to be discarded");
     }
 

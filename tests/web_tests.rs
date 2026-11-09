@@ -14,8 +14,15 @@ async fn web_module_reports_missing_security_headers() {
 
     let findings = Web.run(&target, &config).await.unwrap();
 
+    // HSTS is ignored by browsers over plain HTTP, so it is only reported for
+    // HTTPS responses; the fixture is HTTP-only.
+    assert!(
+        find_finding(&findings, "web", "HSTS").is_none(),
+        "HSTS must not be reported for an HTTP-only response: {:?}",
+        findings
+    );
+
     let expected = [
-        ("HSTS", Severity::High),
         ("CSP", Severity::Medium),
         ("X-Frame-Options", Severity::Medium),
         ("X-Content-Type-Options", Severity::Medium),
@@ -99,6 +106,50 @@ async fn web_module_returns_no_header_findings_when_disabled() {
     assert!(
         !findings.iter().any(|f| f.title.contains("HSTS")),
         "HSTS finding should be disabled: {:?}",
+        findings
+    );
+}
+
+#[tokio::test]
+async fn web_module_reports_hsts_and_untrusted_chain_over_https() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let server = common::TlsServer::start().await;
+    common::wait_for_tls_server(&server.addr(), 1000).await;
+    let target = Target::parse(&server.addr()).unwrap();
+    let mut config = test_config();
+    config.modules.web.check_http = false;
+    config.modules.web.check_https = true;
+    config.modules.web.check_tls_cert = true;
+
+    // With verification off the HTTPS page is fetched and HSTS is checked.
+    config.scanner.verify_tls_certificates = false;
+    let findings = Web.run(&target, &config).await.unwrap();
+    let hsts = find_finding(&findings, "web", "HSTS").expect("missing HSTS finding over HTTPS");
+    assert_eq!(hsts.severity, Severity::High);
+    assert!(find_finding(&findings, "web", "TLS endpoint reachable").is_some());
+
+    // With verification on, the self-signed fixture is reported as untrusted.
+    config.scanner.verify_tls_certificates = true;
+    let findings = Web.run(&target, &config).await.unwrap();
+    let untrusted = find_finding(&findings, "web", "TLS certificate chain not trusted")
+        .expect("missing untrusted chain finding");
+    assert_eq!(untrusted.severity, Severity::High);
+}
+
+#[tokio::test]
+async fn web_module_does_not_report_untrusted_chain_when_tls_is_absent() {
+    let server = TestServer::start().await;
+    wait_for_server(&server.addr(), 1000).await;
+    let target = Target::parse(&server.addr()).unwrap();
+    let mut config = test_config();
+    config.modules.web.check_https = true;
+    config.modules.web.check_tls_cert = true;
+    config.scanner.verify_tls_certificates = true;
+
+    let findings = Web.run(&target, &config).await.unwrap();
+    assert!(
+        find_finding(&findings, "web", "TLS certificate chain").is_none(),
+        "plain-HTTP server must not be reported as an untrusted TLS chain: {:?}",
         findings
     );
 }

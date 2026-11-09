@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::Duration;
 
@@ -10,24 +10,60 @@ use tokio::time::timeout;
 
 /// Check whether an external tool is available on the system.
 ///
-/// A non-empty path that exists on disk or is resolvable via `which` is
-/// considered available. Empty paths resolve to `false`.
+/// Paths containing a directory component must point at an existing file;
+/// bare program names are looked up on `PATH` (honouring `PATHEXT` on
+/// Windows). Empty paths resolve to `false`.
 pub async fn tool_available(path: &Path) -> bool {
+    resolve_tool(path).is_some()
+}
+
+/// Resolve `path` to the executable that would be run, if any.
+pub fn resolve_tool(path: &Path) -> Option<PathBuf> {
     if path.as_os_str().is_empty() {
-        return false;
+        return None;
     }
 
-    if path.exists() {
-        return true;
+    if path.components().count() > 1 || path.is_absolute() {
+        return is_executable(path).then(|| path.to_path_buf());
     }
 
-    match Command::new("which").arg(path).output().await {
-        Ok(output) => output.status.success(),
-        Err(e) => {
-            debug!("failed to run `which {:?}`: {}", path, e);
-            false
+    let search = std::env::var_os("PATH")?;
+    let extensions: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".to_string())
+            .split(';')
+            .map(|s| s.to_string())
+            .chain(std::iter::once(String::new()))
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+
+    for dir in std::env::split_paths(&search) {
+        for ext in &extensions {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(ext);
+            let candidate = dir.join(name);
+            if is_executable(&candidate) {
+                debug!("resolved tool {:?} to {:?}", path, candidate);
+                return Some(candidate);
+            }
         }
     }
+    None
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
 }
 
 /// Run an external program with the supplied arguments, killing it if it
@@ -81,6 +117,12 @@ mod tests {
     #[tokio::test]
     async fn tool_available_false_for_missing_file() {
         assert!(!tool_available(Path::new("/definitely/not/a/tool")).await);
+    }
+
+    #[tokio::test]
+    async fn tool_available_searches_path() {
+        assert!(tool_available(Path::new("sh")).await);
+        assert!(!tool_available(Path::new("definitely-not-a-real-tool-xyz")).await);
     }
 
     #[tokio::test]

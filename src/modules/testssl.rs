@@ -24,17 +24,29 @@ impl Module for Testssl {
     }
 
     async fn run(&self, target: &Target, config: &Config) -> Result<Vec<Finding>> {
-        let host_arg = target.address();
+        let host_arg = target.socket_address(443);
 
         debug!("running testssl.sh against {}", host_arg);
 
-        let (tmp_file, tmp_path) = temp_json_path()?;
+        // testssl.sh refuses to write to a JSON file that already exists, so
+        // hand it a path inside a fresh temporary directory instead of a
+        // pre-created temp file.
+        let tmp_dir = tempfile::Builder::new()
+            .prefix("wasp-testssl-")
+            .tempdir()
+            .context("failed to create temporary directory for testssl.sh output")?;
+        let tmp_path = tmp_dir.path().join("testssl.json");
+
         let mut cmd = Command::new(&config.tools.testssl_path);
-        cmd.arg("--jsonfile-pretty")
+        cmd.arg("--jsonfile")
             .arg(&tmp_path)
+            .args(["--warnings", "batch", "--quiet", "--color", "0"])
+            .arg("--")
             .arg(&host_arg)
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
 
         let mut child = match cmd.spawn() {
             Ok(child) => child,
@@ -56,61 +68,51 @@ impl Module for Testssl {
                     "Install testssl.sh or update tools.testssl_path in the configuration.",
                 )]);
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "failed to run testssl.sh at {:?}",
+                        config.tools.testssl_path
+                    )
+                })
+            }
         };
 
         let dur = Duration::from_secs(config.tools.testssl_timeout_secs);
 
-        let result = async {
-            let status = match timeout(dur, child.wait()).await {
-                Ok(status) => status.context("testssl.sh process failed")?,
-                Err(_) => {
-                    let _ = child.kill().await;
-                    anyhow::bail!("testssl.sh execution timed out after {:?}", dur);
-                }
-            };
-
-            if !status.success() {
-                warn!("testssl.sh exited with status {}", status);
+        let status = match timeout(dur, child.wait()).await {
+            Ok(status) => status.context("testssl.sh process failed")?,
+            Err(_) => {
+                let _ = child.kill().await;
+                anyhow::bail!("testssl.sh execution timed out after {:?}", dur);
             }
+        };
 
-            if !tokio::fs::try_exists(&tmp_path).await.unwrap_or(false) {
-                if status.success() {
-                    anyhow::bail!(
-                        "testssl.sh did not produce the expected JSON file at {:?}",
-                        tmp_path
-                    );
-                } else {
-                    anyhow::bail!(
-                        "testssl.sh failed (exit {}) and did not produce a JSON file",
-                        status
-                    );
-                }
-            }
-
-            let json = tokio::fs::read_to_string(&tmp_path)
-                .await
-                .with_context(|| format!("failed to read testssl.sh JSON from {:?}", tmp_path))?;
-            parse_testssl_json(&json)
+        // testssl.sh uses non-zero exit codes to signal findings, so a failing
+        // status alone is not an error.
+        if !status.success() {
+            debug!("testssl.sh exited with status {}", status);
         }
-        .await;
 
-        let _ = tmp_file.close();
-        result
+        if !tokio::fs::try_exists(&tmp_path).await.unwrap_or(false) {
+            anyhow::bail!(
+                "testssl.sh (exit {}) did not produce the expected JSON file",
+                status
+            );
+        }
+
+        let json = tokio::fs::read_to_string(&tmp_path)
+            .await
+            .with_context(|| format!("failed to read testssl.sh JSON from {:?}", tmp_path))?;
+        parse_testssl_json(&json)
     }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TestsslOutput {
-    #[serde(default)]
-    scan_result: Vec<ScanFinding>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ScanFinding {
     id: String,
+    #[serde(default)]
     severity: String,
     #[serde(default)]
     finding: String,
@@ -162,7 +164,7 @@ fn remediation_for(id: &str) -> &'static str {
         "drown" => "Disable SSLv2 on all servers sharing the certificate/private key.",
         "rc4" | "rc4_expected" => "Disable RC4 cipher suites.",
         "tls1" | "tls1_1" => "Disable TLS 1.0/1.1 and enforce TLS 1.2 or higher.",
-        "expired" | "cert_notAfter" => "Renew and install a valid TLS certificate before expiry.",
+        "expired" | "cert_notafter" => "Renew and install a valid TLS certificate before expiry.",
         "selfsigned" => "Replace the self-signed certificate with one issued by a trusted CA.",
         "chain_of_trust" | "chain_of_trust_warn" => {
             "Install the complete and correct intermediate certificate chain."
@@ -211,19 +213,47 @@ fn scan_entry_to_finding(entry: &ScanFinding) -> Option<Finding> {
     Some(
         Finding::new("testssl", &title, severity, &description)
             .with_evidence(evidence_lines.join("\n"))
-            .with_remediation(remediation_for(&entry.id)),
+            .with_remediation(remediation_for(&entry.id.to_ascii_lowercase())),
     )
 }
 
-fn parse_testssl_json(json: &str) -> Result<Vec<Finding>> {
-    let output: TestsslOutput =
-        serde_json::from_str(json).context("failed to parse testssl.sh JSON")?;
+/// Collect every `{id, severity, finding}` entry from testssl.sh output.
+///
+/// `--jsonfile` produces a flat array of entries. `--jsonfile-pretty` produces
+/// an object whose `scanResult` holds either flat entries (older releases) or
+/// per-target objects grouping entries into sections such as `protocols` and
+/// `vulnerabilities`. All three shapes are accepted.
+fn collect_entries(value: &serde_json::Value, out: &mut Vec<ScanFinding>) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_entries(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if map.contains_key("id") && map.contains_key("severity") {
+                if let Ok(entry) = serde_json::from_value::<ScanFinding>(value.clone()) {
+                    out.push(entry);
+                }
+                return;
+            }
+            for (key, child) in map {
+                if child.is_array() || (key == "scanResult" && child.is_object()) {
+                    collect_entries(child, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
 
-    let mut findings: Vec<Finding> = output
-        .scan_result
-        .iter()
-        .filter_map(scan_entry_to_finding)
-        .collect();
+fn parse_testssl_json(json: &str) -> Result<Vec<Finding>> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).context("failed to parse testssl.sh JSON")?;
+    let mut entries = Vec::new();
+    collect_entries(&value, &mut entries);
+
+    let mut findings: Vec<Finding> = entries.iter().filter_map(scan_entry_to_finding).collect();
 
     let highest = findings.iter().map(|f| f.severity).max();
     let summary = Finding::new(
@@ -247,20 +277,10 @@ fn parse_testssl_json(json: &str) -> Result<Vec<Finding>> {
     Ok(findings)
 }
 
-fn temp_json_path() -> Result<(tempfile::NamedTempFile, std::path::PathBuf)> {
-    let tmp = tempfile::Builder::new()
-        .suffix(".json")
-        .tempfile()
-        .context("failed to create temporary file for testssl.sh output")?;
-    let path = tmp.path().to_path_buf();
-    Ok((tmp, path))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
 
     const SAMPLE_JSON: &str = r#"
     {
@@ -323,8 +343,33 @@ mod tests {
         assert_eq!(findings[0].severity, Severity::Info);
     }
 
+    #[test]
+    fn parses_flat_jsonfile_array() {
+        let json = r#"[
+            {"id":"tls1","ip":"1.2.3.4/1.2.3.4","port":"443","severity":"LOW","finding":"offered"},
+            {"id":"heartbleed","ip":"1.2.3.4/1.2.3.4","port":"443","severity":"OK","finding":"not vulnerable"}
+        ]"#;
+        let findings = parse_testssl_json(json).unwrap();
+        assert!(findings.iter().any(|f| f.title == "TLS issue: tls1"));
+        assert!(!findings.iter().any(|f| f.title == "TLS issue: heartbleed"));
+    }
+
+    #[test]
+    fn parses_nested_pretty_sections() {
+        let json = r#"{"scanResult":[{"targetHost":"example.com","protocols":[
+            {"id":"SSLv3","severity":"HIGH","finding":"offered"}],
+            "vulnerabilities":[{"id":"BREACH","severity":"MEDIUM","finding":"potentially VULNERABLE"}]}]}"#;
+        let findings = parse_testssl_json(json).unwrap();
+        assert!(findings
+            .iter()
+            .any(|f| f.title == "TLS issue: SSLv3" && f.severity == Severity::High));
+        assert!(findings.iter().any(|f| f.title == "TLS issue: BREACH"));
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn fake_testssl_binary_is_invoked() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("fake-testssl.sh");
         {
@@ -335,11 +380,12 @@ mod tests {
 out=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --jsonfile-pretty) out="$2"; shift 2 ;;
+    --jsonfile) out="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
 if [ -z "$out" ]; then exit 1; fi
+if [ -e "$out" ]; then echo "file exists" >&2; exit 1; fi
 cat > "$out" <<'EOF'
 {{
   "scanResult": [

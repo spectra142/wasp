@@ -20,6 +20,8 @@ In plain English:
 3. Each module looks for a specific kind of issue.
 4. Results are combined, deduplicated, and written to a report folder.
 
+Targets without a port are probed on the standard ports (80 for HTTP, 443 for HTTPS/TLS). Paths that a server answers with a generic catch-all page ("soft 404s") are filtered out so single-page apps don't produce hundreds of false "exposed file" findings.
+
 You can run everything with one command, pick only the modules you want, or tune behavior through a config file.
 
 ## Built-in modules
@@ -53,7 +55,9 @@ By default, missing external tools are skipped with an Info finding instead of c
 
 ## Install
 
-You need [Rust](https://www.rust-lang.org/tools/install) version 1.80 or newer.
+Prebuilt binaries for Linux, macOS (Intel and Apple Silicon) and Windows are attached to each [GitHub release](https://github.com/spectra142/wasp/releases), together with a `SHA256SUMS.txt` file.
+
+To build from source you need [Rust](https://www.rust-lang.org/tools/install) 1.89 or newer.
 
 Open a terminal and run:
 
@@ -69,7 +73,7 @@ This downloads dependencies and builds the scanner. The finished binary is at:
 ./target/release/wasp
 ```
 
-You can copy that binary anywhere you like, but keep the `config/` and `wordlists/` folders nearby if you want the default settings to work without editing paths.
+The binary is self-contained: the default config and wordlists are compiled in, so you can copy it anywhere. The `config/` and `wordlists/` folders are only needed if you want to edit them.
 
 ---
 
@@ -92,26 +96,47 @@ This runs the default modules and writes reports to `./wasp-report/`.
 # Run everything, including external adapters if installed
 ./target/release/wasp example.com --full
 
-# Pick specific modules
+# Pick specific modules (unknown names are rejected)
 ./target/release/wasp example.com -m recon,web,tlsaudit
+
+# List every module and whether it is on by default
+./target/release/wasp --list-modules
+
+# Scan a specific port or a URL
+./target/release/wasp example.com:8443
+./target/release/wasp https://example.com
 
 # Write reports to a custom directory
 ./target/release/wasp example.com -o ./my-report
 
-# Limit how many connections run at once
-./target/release/wasp example.com -r 50
+# Limit how many connections run at once, and set the per-request timeout (ms)
+./target/release/wasp example.com -r 50 -t 3000
 
 # Use a custom config file
 ./target/release/wasp example.com -c myconfig.toml
 
-# Safe mode: turns off port scanning and exposed-path probing
+# Safe mode: turns off port scanning, exposed-path probing, CMS enumeration
+# and the nmap/nuclei/wpscan adapters
 ./target/release/wasp example.com --safe-mode
+
+# CI gate: exit with status 2 if anything High or worse is found
+./target/release/wasp example.com --quick --fail-on high
 
 # Disable TLS certificate verification (useful for self-signed/internal targets)
 ./target/release/wasp example.com --insecure
 ```
 
 Run `./target/release/wasp --help` to see every option.
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Scan completed |
+| `1` | Error (bad arguments, unreadable config, report could not be written, ...) |
+| `2` | `--fail-on` threshold was met |
+
+Colour output is used only when stdout is a terminal; pass `--no-color` or set `NO_COLOR` to disable it.
 
 ---
 
@@ -127,26 +152,37 @@ By default WASP creates a `wasp-report/` folder with:
 | `report.md` | Markdown summary |
 | `report.sarif` | SARIF 2.1.0 for GitHub Code Scanning, DefectDojo, etc. |
 
+Leaked credentials are redacted in every report (for example `AKIA********MPLE`, `postgres://admin:****@db/app`), so reports can be shared without becoming a second copy of the secret. CSV cells are escaped against spreadsheet formula injection.
+
 ---
 
 ## Configuration
 
-The default config is `config/default.toml`. Copy it and edit the copy:
+The built-in defaults live in `config/default.toml`. A custom config is **merged over** those defaults, so it only needs the keys you want to change:
 
-```bash
-cp config/default.toml myconfig.toml
+```toml
+# myconfig.toml
+[scanner]
+timeout_ms = 3000
+user_agent = "MyCompany-Scanner/1.0"
+
+[modules.nmap]
+enabled = true
 ```
+
+Unknown keys are rejected, so typos are caught instead of silently ignored.
 
 Useful options:
 
-- `scanner.concurrency` — global concurrent connection/module-task limit
+- `scanner.concurrency` — global limit on simultaneous network connections
+- `scanner.user_agent` — leave empty to send `WASP/<version>`
 - `scanner.timeout_ms` — per-request timeout in milliseconds
 - `scanner.verify_tls_certificates` — verify HTTPS certificates (default: `true`; disable with `--insecure`)
 - `scanner.http_proxy` / `scanner.https_proxy` — optional proxy URLs
 - `scanner.custom_headers` — default headers added to every HTTP request
-- `modules.portscan.top_ports` — number of ports to scan (1..N)
-- `modules.recon.subdomain_wordlist` — path to subdomain wordlist
-- `modules.secrets.path_wordlist` — path to exposed-path wordlist
+- `modules.portscan.top_ports` — number of ports to scan (nmap's top-1000 order first, 1..65535)
+- `modules.recon.subdomain_wordlist` — path to subdomain wordlist (falls back to the built-in list if unreadable)
+- `modules.secrets.path_wordlist` — path to exposed-path wordlist (falls back to the built-in list if unreadable)
 - `modules.nmap.enabled` / `modules.nuclei.enabled` / `modules.testssl.enabled` / `modules.cms.enabled` — enable external adapters
 - `modules.*.check_http` / `modules.*.check_https` — per-module scheme selection
 - `tools.nmap_path`, `tools.nuclei_path`, `tools.testssl_path`, `tools.wpscan_path` — binary paths
@@ -175,7 +211,7 @@ Run the quality gates before submitting changes:
 
 ```bash
 cargo test
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 

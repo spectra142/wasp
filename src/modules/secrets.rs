@@ -1,5 +1,6 @@
-use crate::config::Config;
-use crate::finding::{Finding, Severity};
+use crate::config::{load_wordlist, Config, EMBEDDED_EXPOSED_PATHS_WORDLIST};
+use crate::finding::{redact_secret, Finding, Severity};
+use crate::http::{read_body, NotFoundBaseline};
 use crate::modules::Module;
 use crate::target::Target;
 use anyhow::Result;
@@ -7,7 +8,6 @@ use async_trait::async_trait;
 use log::debug;
 use regex::Regex;
 use std::collections::HashSet;
-use std::fs;
 use std::sync::Arc;
 
 pub struct Secrets;
@@ -28,71 +28,55 @@ impl Module for Secrets {
 
         let client = config.http_client()?;
 
-        let path_wordlist = &config.modules.secrets.path_wordlist;
-        let mut paths = match fs::read_to_string(path_wordlist) {
-            Ok(content) => content
-                .lines()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<_>>(),
-            Err(e) => {
-                debug!(
-                    "failed to read exposed paths wordlist {:?}: {}",
-                    path_wordlist, e
-                );
-                return Ok(findings);
-            }
-        };
+        let mut paths = load_wordlist(
+            &config.modules.secrets.path_wordlist,
+            EMBEDDED_EXPOSED_PATHS_WORDLIST,
+        );
 
         // Merge the configured path wordlist with a small embedded list of common
         // API endpoints so the module probes them even when no dedicated config
         // field is present.
-        let known_endpoints = api_endpoint_wordlist();
-        for endpoint in known_endpoints {
+        for endpoint in api_endpoint_wordlist() {
             if !paths.contains(&endpoint) {
                 paths.push(endpoint);
             }
         }
 
-        let secret_patterns = secret_patterns();
-        let endpoint_regexes = endpoint_extraction_regexes();
-        let semaphore = config
-            .scanner
-            .concurrency_semaphore
-            .clone()
-            .unwrap_or_else(|| {
-                Arc::new(tokio::sync::Semaphore::new(
-                    config.scanner.concurrency.max(1),
-                ))
-            });
-        let check_https = config.modules.secrets.check_https;
-        let check_http = config.modules.secrets.check_http;
+        let mut bases = Vec::new();
+        if config.modules.secrets.check_https {
+            bases.push(format!("https://{}/", host));
+        }
+        if config.modules.secrets.check_http {
+            bases.push(format!("http://{}/", host));
+        }
+
+        let secret_patterns = Arc::new(secret_patterns());
+        let endpoint_regexes = Arc::new(endpoint_extraction_regexes());
+        let semaphore = config.request_limiter();
         let enable_body_regex = config.modules.secrets.enable_body_regex;
         let mut handles = Vec::new();
 
-        for path in paths {
-            let urls: Vec<String> = {
-                let mut v = Vec::new();
-                if check_https {
-                    v.push(format!("https://{}/{}", host, path.trim_start_matches('/')));
-                }
-                if check_http {
-                    v.push(format!("http://{}/{}", host, path.trim_start_matches('/')));
-                }
-                v
-            };
+        for base in bases {
+            // Learn what this server returns for paths that do not exist so
+            // catch-all routes are not reported as hundreds of exposed files.
+            let baseline = Arc::new(NotFoundBaseline::probe(&client, &base).await);
 
-            for url in urls {
+            for path in &paths {
+                let url = format!("{}{}", base, path.trim_start_matches('/'));
                 let permit = semaphore.clone().acquire_owned().await?;
                 let client = client.clone();
-                let patterns = secret_patterns.clone();
-                let extractors = endpoint_regexes.clone();
+                let patterns = Arc::clone(&secret_patterns);
+                let extractors = Arc::clone(&endpoint_regexes);
+                let baseline = Arc::clone(&baseline);
                 let path_str = path.clone();
                 let handle = tokio::spawn(async move {
                     let _permit = permit;
                     let resp = match client.get(&url).send().await {
                         Ok(r) => r,
-                        Err(_) => return None,
+                        Err(e) => {
+                            debug!("secrets: request to {} failed: {}", url, e);
+                            return None;
+                        }
                     };
 
                     let status = resp.status();
@@ -100,14 +84,16 @@ impl Module for Secrets {
                         return None;
                     }
 
-                    let body = match resp.text().await {
-                        Ok(b) => b,
-                        Err(_) => return None,
-                    };
+                    let body = read_body(resp).await;
+                    if baseline.is_soft_404(status, &path_str, &body) {
+                        debug!("secrets: {} matches the soft-404 baseline; skipping", url);
+                        return None;
+                    }
 
                     let mut findings = Vec::new();
 
                     let severity = path_severity(&path_str);
+                    let snippet: String = body.chars().take(256).collect();
                     findings.push(
                         Finding::new(
                             "secrets",
@@ -116,8 +102,8 @@ impl Module for Secrets {
                             &format!("{} returned HTTP {}", url, status),
                         )
                         .with_evidence(format!(
-                            "First 256 chars:\n{}",
-                            body.chars().take(256).collect::<String>()
+                            "First 256 chars (secrets redacted):\n{}",
+                            redact_matches(&snippet, &patterns)
                         ))
                         .with_remediation(
                             "Remove or restrict access to non-public files and backup artifacts.",
@@ -125,8 +111,12 @@ impl Module for Secrets {
                     );
 
                     if enable_body_regex {
-                        for (name, re) in &patterns {
+                        let mut reported = HashSet::new();
+                        for (name, re) in patterns.iter() {
                             for mat in re.find_iter(&body) {
+                                if !reported.insert((*name, mat.as_str().to_string())) {
+                                    continue;
+                                }
                                 findings.push(
                                     Finding::new(
                                         "secrets",
@@ -134,7 +124,7 @@ impl Module for Secrets {
                                         secret_severity(name, mat.as_str()),
                                         &format!("A pattern matching {} was found in {}", name, url),
                                     )
-                                    .with_evidence(mat.as_str().to_string())
+                                    .with_evidence(format!("Match (redacted): {}", redact_secret(mat.as_str())))
                                     .with_remediation("Rotate the exposed credential and remove it from source code or public responses."),
                                 );
                             }
@@ -182,6 +172,17 @@ impl Module for Secrets {
 
         Ok(findings)
     }
+}
+
+/// Replace every secret-pattern match in `text` with its redacted form.
+fn redact_matches(text: &str, patterns: &[(&'static str, Regex)]) -> String {
+    let mut out = text.to_string();
+    for (_, re) in patterns {
+        out = re
+            .replace_all(&out, |caps: &regex::Captures| redact_secret(&caps[0]))
+            .into_owned();
+    }
+    out
 }
 
 /// Embedded wordlist of common API endpoints to probe. These are merged with the
@@ -328,6 +329,10 @@ fn secret_severity(name: &str, matched: &str) -> Severity {
 
 fn path_severity(path: &str) -> Severity {
     let p = path.to_ascii_lowercase();
+    // Public-by-design discovery documents are informational, not leaks.
+    if p.contains(".well-known/") || p.ends_with("robots.txt") || p.ends_with("sitemap.xml") {
+        return Severity::Info;
+    }
     if p.contains(".env")
         || p.contains("id_rsa")
         || p.contains("id_dsa")
@@ -411,6 +416,16 @@ mod tests {
     }
 
     #[test]
+    fn snippets_are_redacted() {
+        let patterns = secret_patterns();
+        let text = "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\nOTHER=1";
+        let redacted = redact_matches(text, &patterns);
+        assert!(!redacted.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(redacted.contains("AKIA********MPLE"));
+        assert!(redacted.contains("OTHER=1"));
+    }
+
+    #[test]
     fn extract_absolute_urls() {
         let extractors = endpoint_extraction_regexes();
         let body = r#"<a href="https://api.example.com/v1/users">link</a>"#;
@@ -454,6 +469,10 @@ mod tests {
         assert_eq!(path_severity("backup.sql"), Severity::High);
         assert_eq!(path_severity("admin/"), Severity::Medium);
         assert_eq!(path_severity("api/v1/users"), Severity::Low);
+        assert_eq!(
+            path_severity(".well-known/openid-configuration"),
+            Severity::Info
+        );
     }
 
     #[test]

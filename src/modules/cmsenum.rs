@@ -138,7 +138,9 @@ async fn check_xmlrpc(client: &Client, base: &str) -> Vec<Finding> {
     let url = format!("{}xmlrpc.php", base);
     if let Some(resp) = fetch(client, &url).await {
         let body_lc = resp.body.to_lowercase();
-        if body_lc.contains("xml-rpc server accepts post requests") || resp.status.is_success() {
+        // GET /xmlrpc.php answers "XML-RPC server accepts POST requests only."
+        // (usually with HTTP 405). A bare 200 proves nothing on catch-all sites.
+        if body_lc.contains("xml-rpc server accepts post requests") {
             return vec![Finding::new(
                 "cmsenum",
                 "WordPress XML-RPC enabled",

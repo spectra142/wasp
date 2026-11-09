@@ -44,7 +44,7 @@ impl Module for Web {
         if config.modules.web.check_headers {
             let primary = https_resp.as_ref().or(http_resp.as_ref());
             if let Some(resp) = primary {
-                findings.append(&mut check_security_headers(resp, config));
+                findings.append(&mut check_security_headers(resp));
             }
         }
 
@@ -64,7 +64,7 @@ impl Module for Web {
             }
         }
 
-        if config.modules.web.check_tls_cert {
+        if config.modules.web.check_tls_cert && config.modules.web.check_https {
             findings.append(&mut check_tls_certificate(target, config).await?);
         }
 
@@ -82,10 +82,13 @@ async fn fetch(client: &Client, url: &str) -> Option<Response> {
     }
 }
 
-fn check_security_headers(resp: &Response, _config: &Config) -> Vec<Finding> {
+fn check_security_headers(resp: &Response) -> Vec<Finding> {
     let mut findings = Vec::new();
     let headers = resp.headers();
     let url = resp.url().to_string();
+    // Browsers ignore Strict-Transport-Security received over plain HTTP, so
+    // its absence there is not a finding (the missing HTTPS redirect is).
+    let is_https = resp.url().scheme() == "https";
 
     let expected = vec![
         (
@@ -127,6 +130,9 @@ fn check_security_headers(resp: &Response, _config: &Config) -> Vec<Finding> {
     ];
 
     for (header, name, message, severity) in expected {
+        if header == "strict-transport-security" && !is_https {
+            continue;
+        }
         if headers.get(header).is_none() {
             findings.push(
                 Finding::new(
@@ -138,6 +144,33 @@ fn check_security_headers(resp: &Response, _config: &Config) -> Vec<Finding> {
                 .with_evidence(format!("URL: {}", url))
                 .with_remediation(format!("Add the {} header to HTTP responses.", name)),
             );
+        }
+    }
+
+    if let Some(hsts) = headers
+        .get("strict-transport-security")
+        .and_then(|v| v.to_str().ok())
+        .filter(|_| is_https)
+    {
+        if let Some(max_age) = parse_hsts_max_age(hsts) {
+            // Six months is the commonly recommended minimum.
+            if max_age < 15_552_000 {
+                findings.push(
+                    Finding::new(
+                        "web",
+                        "Weak HSTS max-age",
+                        Severity::Low,
+                        "The Strict-Transport-Security max-age is shorter than six months",
+                    )
+                    .with_evidence(format!(
+                        "URL: {} | Strict-Transport-Security: {}",
+                        url, hsts
+                    ))
+                    .with_remediation(
+                        "Set max-age to at least 15552000 (180 days); 31536000 is typical.",
+                    ),
+                );
+            }
         }
     }
 
@@ -157,15 +190,27 @@ fn check_security_headers(resp: &Response, _config: &Config) -> Vec<Finding> {
     findings
 }
 
+/// Extract the `max-age` directive (in seconds) from an HSTS header value.
+fn parse_hsts_max_age(value: &str) -> Option<u64> {
+    value.split(';').find_map(|directive| {
+        let (name, val) = directive.trim().split_once('=')?;
+        if name.trim().eq_ignore_ascii_case("max-age") {
+            val.trim().trim_matches('"').parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
 fn check_cookies(resp: &Response) -> Vec<Finding> {
     let mut findings = Vec::new();
     let url = resp.url().to_string();
 
     for cookie in resp.cookies() {
+        // Never copy cookie values into reports; they are often session tokens.
         let raw = format!(
-            "{}={}; Domain={}; Path={}",
+            "{}=<redacted>; Domain={}; Path={}",
             cookie.name(),
-            cookie.value(),
             cookie.domain().unwrap_or(""),
             cookie.path().unwrap_or("")
         );
@@ -235,7 +280,8 @@ fn check_https_redirect(resp: &Response, requested_url: &str) -> Vec<Finding> {
 async fn check_tls_certificate(target: &Target, config: &Config) -> Result<Vec<Finding>> {
     let mut findings = Vec::new();
     let host = target.host();
-    let addr = target.address();
+    // Bare targets carry no port; HTTPS lives on 443 unless told otherwise.
+    let addr = target.socket_address(443);
     let dur = config.timeout();
 
     let server_name = match &target.host {
@@ -249,65 +295,73 @@ async fn check_tls_certificate(target: &Target, config: &Config) -> Result<Vec<F
     // algorithms, etc.) lives in the tlsaudit module. Web only reports whether
     // TLS is reachable and whether the chain is trusted, avoiding duplicate
     // findings when both modules are enabled.
-    if config.scanner.verify_tls_certificates {
-        match check_tls_trust(&addr, &server_name, dur).await {
-            Ok(()) => {
-                findings.push(
-                    Finding::new(
-                        "web",
-                        "TLS certificate chain trusted",
-                        Severity::Info,
-                        "The server's TLS certificate chain validated against the system's root store",
-                    )
-                    .with_remediation("No action required; the certificate is trusted."),
-                );
-            }
-            Err(e) => {
-                findings.push(
-                    Finding::new(
-                        "web",
-                        "TLS certificate chain not trusted",
-                        Severity::High,
-                        "The server's TLS certificate chain failed validation",
-                    )
-                    .with_evidence(format!("Error: {}", e))
-                    .with_remediation(
-                        "Install a valid certificate from a trusted CA, or import the issuing CA into the scanner's trust store.",
-                    ),
-                );
-            }
+    //
+    // A plain handshake (no verification) runs first so that "TLS is not
+    // offered at all" is never misreported as "certificate not trusted".
+    if let Err(e) = handshake(&addr, &server_name, dur, false).await {
+        debug!("TLS not available on {}: {:#}", addr, e);
+        return Ok(findings);
+    }
+
+    if !config.scanner.verify_tls_certificates {
+        findings.push(
+            Finding::new(
+                "web",
+                "TLS endpoint reachable",
+                Severity::Info,
+                "The target accepted a TLS handshake",
+            )
+            .with_evidence(format!("Target: {}", addr))
+            .with_remediation(
+                "Use tlsaudit for detailed certificate, version, and cipher findings.",
+            ),
+        );
+        return Ok(findings);
+    }
+
+    match handshake(&addr, &server_name, dur, true).await {
+        Ok(()) => {
+            findings.push(
+                Finding::new(
+                    "web",
+                    "TLS certificate chain trusted",
+                    Severity::Info,
+                    "The server's TLS certificate chain validated against the bundled Mozilla root store",
+                )
+                .with_evidence(format!("Target: {}", addr))
+                .with_remediation("No action required; the certificate is trusted."),
+            );
         }
-    } else {
-        // When verification is disabled, at least confirm that TLS is available.
-        match check_tls_available(&addr, &server_name, dur).await {
-            Ok(()) => {
-                findings.push(
-                    Finding::new(
-                        "web",
-                        "TLS endpoint reachable",
-                        Severity::Info,
-                        "The target accepted a TLS handshake",
-                    )
-                    .with_remediation(
-                        "Use tlsaudit for detailed certificate, version, and cipher findings.",
-                    ),
-                );
-            }
-            Err(e) => {
-                debug!("TLS availability check failed for {}: {}", addr, e);
-            }
+        Err(e) => {
+            findings.push(
+                Finding::new(
+                    "web",
+                    "TLS certificate chain not trusted",
+                    Severity::High,
+                    "The server's TLS certificate chain failed validation",
+                )
+                .with_evidence(format!("Target: {} | Error: {:#}", addr, e))
+                .with_remediation(
+                    "Install a valid certificate (with its full intermediate chain) from a trusted CA. For internal CAs, re-run with --insecure.",
+                ),
+            );
         }
     }
 
     Ok(findings)
 }
 
-async fn check_tls_available(
+async fn handshake(
     addr: &str,
     server_name: &ServerName<'static>,
     dur: std::time::Duration,
+    verify: bool,
 ) -> Result<()> {
-    let connector = crate::tls::build_unverified_connector()?;
+    let connector = if verify {
+        crate::tls::build_verified_connector()?
+    } else {
+        crate::tls::build_unverified_connector()?
+    };
     let stream = timeout(dur, TcpStream::connect(addr))
         .await
         .map_err(|_| anyhow::anyhow!("TCP connect timed out"))?
@@ -319,19 +373,20 @@ async fn check_tls_available(
     Ok(())
 }
 
-async fn check_tls_trust(
-    addr: &str,
-    server_name: &ServerName<'static>,
-    dur: std::time::Duration,
-) -> Result<()> {
-    let connector = crate::tls::build_verified_connector()?;
-    let stream = timeout(dur, TcpStream::connect(addr))
-        .await
-        .map_err(|_| anyhow::anyhow!("TCP connect timed out"))?
-        .context("TCP connect failed")?;
-    timeout(dur, connector.connect(server_name.clone(), stream))
-        .await
-        .map_err(|_| anyhow::anyhow!("TLS handshake timed out"))?
-        .context("TLS handshake failed")?;
-    Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_hsts_max_age() {
+        assert_eq!(
+            parse_hsts_max_age("max-age=31536000; includeSubDomains"),
+            Some(31536000)
+        );
+        assert_eq!(
+            parse_hsts_max_age("includeSubDomains; MAX-AGE=\"300\""),
+            Some(300)
+        );
+        assert_eq!(parse_hsts_max_age("includeSubDomains"), None);
+    }
 }

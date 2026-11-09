@@ -254,7 +254,10 @@ async fn detects_open_redirect() {
     let finding = find_finding(&findings, "webvulns", "Open redirect")
         .expect("missing open redirect finding");
     assert_eq!(finding.severity, Severity::Medium);
-    assert!(finding.evidence.iter().any(|e| e.contains("evil.com")));
+    assert!(finding
+        .evidence
+        .iter()
+        .any(|e| e.contains("wasp-redirect-canary.invalid")));
 }
 
 #[tokio::test]
