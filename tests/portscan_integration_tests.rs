@@ -50,7 +50,7 @@ async fn scanner_runs_portscan_and_web_modules_concurrently() {
     config.modules.web.check_tls_cert = false;
     config.modules.secrets.enabled = false;
 
-    let scanner = Scanner::new(config).with_rate_limit(None);
+    let scanner = Scanner::new(config);
     let report = scanner.run(&target).await.unwrap();
 
     let portscan_findings: Vec<_> = report

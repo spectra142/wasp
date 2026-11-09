@@ -43,15 +43,13 @@ impl Module for Nmap {
         let top_ports_str = top_ports.to_string();
         // -Pn treats the host as up so the scan proceeds even when ICMP/ping is
         // filtered, which is common in proxy/TOR/VPN and hardened environments.
-        let args = vec![
-            "-oX",
-            "-",
-            "-Pn",
-            "-sV",
-            "--top-ports",
-            &top_ports_str,
-            &host,
-        ];
+        let mut args = vec!["-oX", "-", "-Pn", "-sV", "--top-ports", &top_ports_str];
+        if matches!(target.host, url::Host::Ipv6(_)) {
+            args.push("-6");
+        }
+        // `--` stops option parsing so a hostile hostname cannot inject flags.
+        args.push("--");
+        args.push(&host);
 
         let output = run_tool(
             nmap_path,

@@ -5,7 +5,7 @@ use crate::finding::{Finding, Severity};
 use crate::modules::Module;
 use crate::target::Target;
 use crate::tls;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use log::debug;
@@ -19,6 +19,7 @@ use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use x509_parser::extensions::GeneralName;
 use x509_parser::prelude::*;
+use x509_parser::public_key::PublicKey;
 
 pub struct TlsAudit;
 
@@ -33,7 +34,8 @@ impl Module for TlsAudit {
     }
 
     async fn run(&self, target: &Target, config: &Config) -> Result<Vec<Finding>> {
-        let addr = target.address();
+        // Bare targets carry no port; TLS is audited on 443 unless told otherwise.
+        let addr = target.socket_address(443);
         let server_name = server_name_for(target)?;
         let host = target.host();
         let dur = config.timeout();
@@ -143,26 +145,13 @@ async fn check_versions(
             Finding::new(
                 "tlsaudit",
                 "TLS 1.3 not supported",
-                Severity::Medium,
+                Severity::Low,
                 "The server supports TLS 1.2 but not the latest TLS version",
             )
             .with_evidence("Only TLS 1.2 handshake succeeded")
             .with_remediation(
                 "Enable TLS 1.3 on the server for improved security and performance.",
             ),
-        );
-    }
-
-    if tls12 {
-        findings.push(
-            Finding::new(
-                "tlsaudit",
-                "Legacy TLS 1.2 supported",
-                Severity::Low,
-                "TLS 1.2 is considered legacy and should be disabled where possible",
-            )
-            .with_evidence("The server accepted a TLS 1.2 handshake")
-            .with_remediation("Disable TLS 1.2 and require TLS 1.3 if clients support it."),
         );
     }
 
@@ -312,13 +301,14 @@ async fn probe_legacy_tls_version(
             return false;
         }
         debug!(
-            "legacy {} probe for {} succeeded; server chose 0x{:02x}{:02x}",
+            "legacy {} probe for {} got ServerHello choosing 0x{:02x}{:02x}",
             version.as_str(),
             addr,
             server_version[0],
             server_version[1]
         );
-        true
+        // Only count the version as supported if the server actually picked it.
+        server_version == version.version_bytes()
     } else {
         false
     }
@@ -471,19 +461,6 @@ async fn check_ciphers(
         );
     }
 
-    if supported.iter().any(|i| i.version == "TLS 1.2") {
-        findings.push(
-            Finding::new(
-                "tlsaudit",
-                "TLS 1.2 cipher suites supported",
-                Severity::Low,
-                "Cipher suites used with the legacy TLS 1.2 protocol were accepted",
-            )
-            .with_evidence("At least one TLS 1.2 cipher suite handshake succeeded")
-            .with_remediation("Disable TLS 1.2 cipher suites if all clients support TLS 1.3."),
-        );
-    }
-
     Ok(findings)
 }
 
@@ -549,7 +526,7 @@ async fn check_certificate(
     server_name: &ServerName<'static>,
     dur: Duration,
 ) -> Result<Vec<Finding>> {
-    let addr = target.address();
+    let addr = target.socket_address(443);
     let host = target.host();
     let mut findings = Vec::new();
 
@@ -593,8 +570,22 @@ async fn check_certificate(
     };
 
     let leaf: &CertificateDer<'_> = &certs[0];
-    let (_, cert) =
-        X509Certificate::from_der(leaf.as_ref()).context("failed to parse TLS certificate")?;
+    let cert = match X509Certificate::from_der(leaf.as_ref()) {
+        Ok((_, cert)) => cert,
+        Err(e) => {
+            findings.push(
+                Finding::new(
+                    "tlsaudit",
+                    "TLS certificate could not be parsed",
+                    Severity::Low,
+                    "The server presented a certificate that is not valid DER/X.509",
+                )
+                .with_evidence(format!("Target: {} | Error: {}", addr, e))
+                .with_remediation("Re-issue the certificate with a standards-compliant CA."),
+            );
+            return Ok(findings);
+        }
+    };
 
     findings.append(&mut evaluate_certificate(&cert, &host));
     Ok(findings)
@@ -610,11 +601,19 @@ fn evaluate_certificate(cert: &X509Certificate, host: &str) -> Vec<Finding> {
     let expiry = DateTime::from_timestamp(not_after, 0).unwrap_or_default();
     let start = DateTime::from_timestamp(not_before, 0).unwrap_or_default();
     let now = Utc::now();
-    let key_size = cert
-        .public_key()
-        .parsed()
-        .map(|pk| pk.key_size())
-        .unwrap_or(0);
+    let (key_type, key_size) = match cert.public_key().parsed() {
+        Ok(PublicKey::RSA(rsa)) => ("RSA", rsa.key_size()),
+        Ok(PublicKey::EC(ec)) => ("EC", ec.key_size()),
+        Ok(other @ PublicKey::DSA(_)) => ("DSA", other.key_size()),
+        Ok(other) => ("other", other.key_size()),
+        Err(_) => ("unknown", 0),
+    };
+    // RSA/DSA need >= 2048 bits; elliptic-curve keys need >= 224 bits.
+    let weak_key = match key_type {
+        "RSA" | "DSA" => key_size > 0 && key_size < 2048,
+        "EC" => key_size > 0 && key_size < 224,
+        _ => false,
+    };
 
     let signature_oid = cert.signature_algorithm.oid().to_id_string();
 
@@ -626,8 +625,8 @@ fn evaluate_certificate(cert: &X509Certificate, host: &str) -> Vec<Finding> {
             "TLS certificate details from the target",
         )
         .with_evidence(format!(
-            "Subject: {} | Issuer: {} | Valid: {} to {} | Key size: {} bits | Signature: {}",
-            subject, issuer, start, expiry, key_size, signature_oid
+            "Subject: {} | Issuer: {} | Valid: {} to {} | Key: {} {} bits | Signature: {}",
+            subject, issuer, start, expiry, key_type, key_size, signature_oid
         ))
         .with_remediation("Ensure the certificate is valid, trusted, and renewed before expiry."),
     );
@@ -643,13 +642,29 @@ fn evaluate_certificate(cert: &X509Certificate, host: &str) -> Vec<Finding> {
             .with_evidence(format!("Expired on: {}", expiry))
             .with_remediation("Renew and install a valid TLS certificate immediately."),
         );
+    } else if start > now {
+        findings.push(
+            Finding::new(
+                "tlsaudit",
+                "TLS certificate not yet valid",
+                Severity::High,
+                "The server's TLS certificate validity period has not started",
+            )
+            .with_evidence(format!("Valid from: {}", start))
+            .with_remediation("Check the server clock and the certificate's notBefore date."),
+        );
     } else if (expiry - now).num_days() < 30 {
+        let days = (expiry - now).num_days();
         findings.push(
             Finding::new(
                 "tlsaudit",
                 "TLS certificate expiring soon",
-                Severity::Low,
-                "The server's TLS certificate expires within 30 days",
+                if days < 7 {
+                    Severity::Medium
+                } else {
+                    Severity::Low
+                },
+                &format!("The server's TLS certificate expires in {} day(s)", days),
             )
             .with_evidence(format!("Expires on: {}", expiry))
             .with_remediation("Renew the TLS certificate before expiry."),
@@ -684,15 +699,15 @@ fn evaluate_certificate(cert: &X509Certificate, host: &str) -> Vec<Finding> {
         );
     }
 
-    if key_size > 0 && key_size < 2048 {
+    if weak_key {
         findings.push(
             Finding::new(
                 "tlsaudit",
                 "Weak TLS certificate key size",
                 Severity::High,
-                "The certificate uses a key smaller than 2048 bits",
+                "The certificate's public key is too small to be considered secure",
             )
-            .with_evidence(format!("Key size: {} bits", key_size))
+            .with_evidence(format!("Key: {} {} bits", key_type, key_size))
             .with_remediation(
                 "Re-issue the certificate with at least a 2048-bit RSA or 256-bit ECDSA key.",
             ),

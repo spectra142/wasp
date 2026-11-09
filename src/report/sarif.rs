@@ -1,7 +1,6 @@
 use crate::finding::{Finding, Report, Severity};
 use anyhow::{Context, Result};
 use serde::Serialize;
-use serde_json;
 use std::fs;
 use std::path::Path;
 
@@ -35,6 +34,18 @@ struct Driver {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "informationUri")]
     information_uri: Option<String>,
+    rules: Vec<Rule>,
+}
+
+#[derive(Debug, Serialize)]
+struct Rule {
+    id: String,
+    name: String,
+    #[serde(rename = "shortDescription")]
+    short_description: Message,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    help: Option<Message>,
+    properties: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -90,17 +101,40 @@ fn information_uri() -> Option<String> {
 }
 
 fn slugify(title: &str) -> String {
-    title
-        .to_ascii_lowercase()
-        .replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '_', "-")
-        .replace("--", "-")
-        .trim_matches('-')
-        .to_string()
+    let mut slug = String::with_capacity(title.len());
+    for c in title.to_ascii_lowercase().chars() {
+        let c = if c.is_ascii_alphanumeric() || c == '_' {
+            c
+        } else {
+            '-'
+        };
+        if c == '-' && slug.ends_with('-') {
+            continue;
+        }
+        slug.push(c);
+    }
+    slug.trim_matches('-').to_string()
+}
+
+/// GitHub code scanning reads `security-severity` (a CVSS-like 0-10 score) to
+/// bucket alerts; map WASP severities onto the bands it documents.
+fn security_severity(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Critical => "9.5",
+        Severity::High => "8.0",
+        Severity::Medium => "5.5",
+        Severity::Low => "2.0",
+        Severity::Info => "0.0",
+    }
+}
+
+fn rule_id(finding: &Finding) -> String {
+    format!("{}/{}", finding.module, slugify(&finding.title))
 }
 
 fn finding_to_result(finding: &Finding, target: &str) -> SarifResult {
     SarifResult {
-        rule_id: format!("{}/{}", finding.module, slugify(&finding.title)),
+        rule_id: rule_id(finding),
         message: Message {
             text: format!("{}: {}", finding.title, finding.description),
         },
@@ -129,6 +163,29 @@ pub fn write(report: &Report, path: &Path) -> Result<()> {
         .map(|f| finding_to_result(f, &report.target))
         .collect();
 
+    let mut rules: Vec<Rule> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for finding in &report.findings {
+        let id = rule_id(finding);
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        rules.push(Rule {
+            id,
+            name: finding.title.clone(),
+            short_description: Message {
+                text: finding.title.clone(),
+            },
+            help: (!finding.remediation.is_empty()).then(|| Message {
+                text: finding.remediation.clone(),
+            }),
+            properties: serde_json::json!({
+                "security-severity": security_severity(finding.severity),
+                "tags": ["security", finding.module],
+            }),
+        });
+    }
+
     let sarif = SarifLog {
         schema: SARIF_SCHEMA.to_string(),
         version: SARIF_VERSION.to_string(),
@@ -138,6 +195,7 @@ pub fn write(report: &Report, path: &Path) -> Result<()> {
                     name: "WASP".to_string(),
                     version: Some(env!("CARGO_PKG_VERSION").to_string()),
                     information_uri: information_uri(),
+                    rules,
                 },
             },
             results,
@@ -201,6 +259,32 @@ mod tests {
             "example.com:443"
         );
         assert_eq!(results[0]["properties"]["severity"], "high");
+    }
+
+    #[test]
+    fn slugify_collapses_separators() {
+        assert_eq!(slugify("Open port 22/tcp (ssh)"), "open-port-22-tcp-ssh");
+        assert_eq!(slugify("A   --  B"), "a-b");
+    }
+
+    #[test]
+    fn rules_are_emitted_once_per_rule_id() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("report.sarif");
+        let mut report = sample_report();
+        report.add_findings(vec![Finding::new(
+            "web",
+            "Missing HSTS header",
+            Severity::High,
+            "dup",
+        )]);
+        write(&report, &path).unwrap();
+        let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let rules = value["runs"][0]["tool"]["driver"]["rules"]
+            .as_array()
+            .unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["properties"]["security-severity"], "8.0");
     }
 
     #[test]

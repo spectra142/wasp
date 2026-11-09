@@ -99,8 +99,10 @@ async fn web_module_detects_missing_headers_and_cookie_flags() {
     let titles: Vec<&str> = findings.iter().map(|f| f.title.as_str()).collect();
 
     assert!(
-        titles.iter().any(|t| t.contains("HSTS")),
-        "missing HSTS finding: {:?}",
+        titles
+            .iter()
+            .any(|t| t.contains("Content-Security-Policy") || t.contains("CSP")),
+        "missing CSP finding: {:?}",
         titles
     );
     assert!(

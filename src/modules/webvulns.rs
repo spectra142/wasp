@@ -2,6 +2,7 @@
 
 use crate::config::Config;
 use crate::finding::{Finding, Severity};
+use crate::http::{read_body, NotFoundBaseline};
 use crate::modules::Module;
 use crate::target::Target;
 use anyhow::Result;
@@ -9,6 +10,7 @@ use async_trait::async_trait;
 use log::debug;
 use reqwest::{Client, Method};
 use std::sync::Arc;
+use url::Url;
 
 pub struct WebVulns;
 
@@ -69,27 +71,20 @@ impl Module for WebVulns {
 
         if cfg.check_sensitive_files {
             let paths = sensitive_path_wordlist();
-            let semaphore = config
-                .scanner
-                .concurrency_semaphore
-                .clone()
-                .unwrap_or_else(|| {
-                    Arc::new(tokio::sync::Semaphore::new(
-                        config.scanner.concurrency.max(1),
-                    ))
-                });
+            let semaphore = config.request_limiter();
             let mut handles = Vec::new();
 
             for base in &bases {
+                let baseline = Arc::new(NotFoundBaseline::probe(&client, base).await);
                 for path in &paths {
                     let permit = semaphore.clone().acquire_owned().await?;
                     let client = client.clone();
                     let path = path.to_string();
-                    let base = base.clone();
+                    let baseline = Arc::clone(&baseline);
                     let url = format!("{}{}", base, path.trim_start_matches('/'));
                     let handle = tokio::spawn(async move {
                         let _permit = permit;
-                        check_sensitive_path(&client, &url, &path).await
+                        check_sensitive_path(&client, &url, &path, &baseline).await
                     });
                     handles.push(handle);
                 }
@@ -220,13 +215,35 @@ async fn check_cors(client: &Client, base_url: &str) -> Vec<Finding> {
 /// response whose Location header points to the external host is reported.
 async fn check_open_redirect(client: &Client, base_url: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
-    let params = ["redirect", "url", "next", "return", "returnUrl"];
-    let payloads = ["http://evil.com", "//evil.com"];
+    let params = [
+        "redirect",
+        "redirect_uri",
+        "redirect_url",
+        "url",
+        "next",
+        "return",
+        "returnUrl",
+        "return_to",
+        "dest",
+        "destination",
+        "continue",
+        "goto",
+    ];
+    let payloads = [
+        format!("https://{}/", REDIRECT_CANARY_HOST),
+        format!("//{}/", REDIRECT_CANARY_HOST),
+    ];
     let root = base_url.trim_end_matches('/');
+    let base = match Url::parse(base_url) {
+        Ok(u) => u,
+        Err(_) => return findings,
+    };
 
     for param in &params {
         for payload in &payloads {
-            let url = format!("{}?{}={}", root, param, payload);
+            // `:` and `/` are legal inside a query string, so the payload is
+            // sent verbatim, exactly as a crafted phishing link would be.
+            let url = format!("{}/?{}={}", root, param, payload);
             let resp = match client.get(&url).send().await {
                 Ok(r) => r,
                 Err(e) => {
@@ -239,7 +256,7 @@ async fn check_open_redirect(client: &Client, base_url: &str) -> Vec<Finding> {
             if status.is_redirection() {
                 if let Some(location) = resp.headers().get("location").and_then(|v| v.to_str().ok())
                 {
-                    if location.contains("evil.com") || location.starts_with("//evil.com") {
+                    if redirects_to_host(&base, location, REDIRECT_CANARY_HOST) {
                         findings.push(
                             Finding::new(
                                 "webvulns",
@@ -266,6 +283,25 @@ async fn check_open_redirect(client: &Client, base_url: &str) -> Vec<Finding> {
     findings
 }
 
+/// Host used as the open-redirect destination. `.invalid` is reserved by
+/// RFC 2606, so it can never resolve to a real site.
+const REDIRECT_CANARY_HOST: &str = "wasp-redirect-canary.invalid";
+
+/// Whether a `Location` header (resolved against `base`) sends the browser to
+/// `host`. Matching on the parsed host avoids false positives such as
+/// `/login?next=https://canary`, which merely echoes the payload.
+fn redirects_to_host(base: &Url, location: &str, host: &str) -> bool {
+    // Browsers treat backslashes like forward slashes in this position.
+    let normalized = location.trim().replace('\\', "/");
+    match base.join(&normalized) {
+        Ok(resolved) => resolved
+            .host_str()
+            .map(|h| h.eq_ignore_ascii_case(host))
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
 /// Probe for HTTP TRACE support.
 ///
 /// TRACE is generally unnecessary and enables cross-site tracing (XST) when
@@ -274,7 +310,13 @@ async fn check_trace(client: &Client, base_url: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
     let url = base_url.trim_end_matches('/').to_string();
 
-    let resp = match client.request(Method::TRACE, &url).send().await {
+    let marker = format!("wasp-trace-{}", crate::http::random_token());
+    let resp = match client
+        .request(Method::TRACE, &url)
+        .header("X-Wasp-Trace", &marker)
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             debug!("TRACE request to {} failed: {}", url, e);
@@ -284,7 +326,12 @@ async fn check_trace(client: &Client, base_url: &str) -> Vec<Finding> {
 
     let status = resp.status();
     if status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        let body = read_body(resp).await;
+        // A real TRACE implementation echoes the request back. Servers that
+        // answer every method with their normal page are not vulnerable.
+        if !body.contains(&marker) && !body.to_ascii_uppercase().starts_with("TRACE ") {
+            return findings;
+        }
         findings.push(
             Finding::new(
                 "webvulns",
@@ -369,7 +416,12 @@ async fn check_options(client: &Client, base_url: &str) -> Vec<Finding> {
 
 /// Probe a single sensitive path and report it when the server returns a
 /// successful response.
-async fn check_sensitive_path(client: &Client, url: &str, path: &str) -> Option<Finding> {
+async fn check_sensitive_path(
+    client: &Client,
+    url: &str,
+    path: &str,
+    baseline: &NotFoundBaseline,
+) -> Option<Finding> {
     let resp = match client.get(url).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -383,8 +435,12 @@ async fn check_sensitive_path(client: &Client, url: &str, path: &str) -> Option<
         return None;
     }
 
+    let body = read_body(resp).await;
+    if baseline.is_soft_404(status, path, &body) {
+        debug!("{} matches the soft-404 baseline; skipping", url);
+        return None;
+    }
     let severity = sensitive_path_severity(path);
-    let body = resp.text().await.unwrap_or_default();
     let snippet: String = body.chars().take(256).collect();
 
     Some(
@@ -479,6 +535,10 @@ fn sensitive_path_wordlist() -> Vec<&'static str> {
 
 fn sensitive_path_severity(path: &str) -> Severity {
     let p = path.to_ascii_lowercase();
+    // Public-by-design discovery documents are informational, not leaks.
+    if p.contains(".well-known/") || p == "robots.txt" || p == "sitemap.xml" {
+        return Severity::Info;
+    }
     if p.contains(".env")
         || p.contains(".git")
         || p.contains("backup")
@@ -527,10 +587,7 @@ async fn check_verbose_error(client: &Client, base_url: &str) -> Vec<Finding> {
             }
         };
 
-        let body = match resp.text().await {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
+        let body = read_body(resp).await;
 
         if is_verbose_error_page(&body) {
             findings.push(
@@ -557,28 +614,52 @@ async fn check_verbose_error(client: &Client, base_url: &str) -> Vec<Finding> {
 }
 
 fn is_verbose_error_page(body: &str) -> bool {
-    let lower = body.to_lowercase();
-    let patterns = [
-        "stack trace",
-        "traceback",
-        "sql syntax",
-        "exception in",
-        "runtime error",
-        "on line ",
-        "/var/www",
-        "c:\\\\",
-        "undefined index",
-        "fatal error",
-        "warning: ",
-        "error details",
-        "trace information",
-    ];
-    patterns.iter().any(|p| lower.contains(p))
+    VERBOSE_ERROR_RE.is_match(body)
 }
+
+/// Signatures of framework debug pages and stack traces. These are specific
+/// enough not to fire on ordinary prose such as "Warning: cookies required".
+static VERBOSE_ERROR_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)traceback \(most recent call last\)|stack trace:|<b>(?:fatal error|warning|notice|parse error)</b>:|(?:fatal error|parse error): .* on line \d+|you have an error in your sql syntax|sql syntax.{0,40}near|unclosed quotation mark after the character string|ORA-\d{5}|pg_query\(\)|SQLSTATE\[|exception in (?:thread|\w+controller)|at [\w.$]+\([\w]+\.java:\d+\)|server error in '/' application|whitelabel error page|django\.core\.exceptions|werkzeug debugger|undefined index:|runtime error|/var/www/|[a-z]:\\inetpub\\",
+    )
+    .expect("valid verbose error regex")
+});
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redirect_detection_uses_parsed_host() {
+        let base = Url::parse("http://example.com/").unwrap();
+        let host = REDIRECT_CANARY_HOST;
+        assert!(redirects_to_host(
+            &base,
+            &format!("https://{}/", host),
+            host
+        ));
+        assert!(redirects_to_host(&base, &format!("//{}/x", host), host));
+        assert!(redirects_to_host(&base, &format!("/\\{}/", host), host));
+        // Echoing the payload in a same-site URL is not an open redirect.
+        assert!(!redirects_to_host(
+            &base,
+            &format!("/login?next=https://{}/", host),
+            host
+        ));
+        assert!(!redirects_to_host(
+            &base,
+            &format!("https://{}.example.com/", host),
+            host
+        ));
+    }
+
+    #[test]
+    fn verbose_error_ignores_ordinary_prose() {
+        assert!(!is_verbose_error_page(
+            "<p>Warning: this site uses cookies. Read our policy on line 3.</p>"
+        ));
+    }
 
     #[test]
     fn sensitive_path_severity_classifications() {
@@ -590,7 +671,11 @@ mod tests {
         assert_eq!(sensitive_path_severity("wp-login.php"), Severity::Medium);
         assert_eq!(sensitive_path_severity("actuator/health"), Severity::Medium);
         assert_eq!(sensitive_path_severity("api/"), Severity::Low);
-        assert_eq!(sensitive_path_severity("robots.txt"), Severity::Low);
+        assert_eq!(sensitive_path_severity("robots.txt"), Severity::Info);
+        assert_eq!(
+            sensitive_path_severity(".well-known/openid-configuration"),
+            Severity::Info
+        );
     }
 
     #[test]

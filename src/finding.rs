@@ -15,6 +15,35 @@ pub enum Severity {
     Critical,
 }
 
+impl Severity {
+    /// All severities from most to least severe.
+    pub const ALL_DESCENDING: [Severity; 5] = [
+        Severity::Critical,
+        Severity::High,
+        Severity::Medium,
+        Severity::Low,
+        Severity::Info,
+    ];
+}
+
+impl std::str::FromStr for Severity {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "info" | "informational" => Ok(Severity::Info),
+            "low" => Ok(Severity::Low),
+            "medium" | "moderate" => Ok(Severity::Medium),
+            "high" => Ok(Severity::High),
+            "critical" => Ok(Severity::Critical),
+            other => Err(format!(
+                "unknown severity '{}' (expected info, low, medium, high or critical)",
+                other
+            )),
+        }
+    }
+}
+
 impl fmt::Display for Severity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
@@ -63,9 +92,45 @@ impl Finding {
     }
 }
 
+/// Mask a secret so reports prove a credential was exposed without becoming
+/// a second copy of it. Credentials embedded in URLs keep their scheme, user
+/// and host; other values keep at most four characters at each end.
+pub fn redact_secret(secret: &str) -> String {
+    if let Some(scheme_end) = secret.find("://") {
+        let rest = &secret[scheme_end + 3..];
+        if let Some(at) = rest.rfind('@') {
+            let userinfo = &rest[..at];
+            if let Some(colon) = userinfo.find(':') {
+                return format!(
+                    "{}{}:****{}",
+                    &secret[..scheme_end + 3],
+                    &userinfo[..colon],
+                    &rest[at..]
+                );
+            }
+        }
+        return secret.to_string();
+    }
+
+    let chars: Vec<char> = secret.chars().collect();
+    if chars.len() <= 12 {
+        return "*".repeat(chars.len().max(4));
+    }
+    let keep = 4;
+    let head: String = chars[..keep].iter().collect();
+    let tail: String = chars[chars.len() - keep..].iter().collect();
+    format!("{}{}{}", head, "*".repeat(8), tail)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
+    /// WASP version that produced the report.
+    #[serde(default)]
+    pub tool_version: String,
     pub target: String,
+    /// Modules that ran during the scan.
+    #[serde(default)]
+    pub modules: Vec<String>,
     pub started_at: DateTime<Utc>,
     pub finished_at: DateTime<Utc>,
     pub findings: Vec<Finding>,
@@ -74,7 +139,9 @@ pub struct Report {
 impl Report {
     pub fn new(target: impl Into<String>) -> Self {
         Self {
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
             target: target.into(),
+            modules: Vec::new(),
             started_at: Utc::now(),
             finished_at: Utc::now(),
             findings: Vec::new(),
@@ -87,7 +154,27 @@ impl Report {
 
     pub fn finalize(&mut self) {
         self.finished_at = Utc::now();
-        self.findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
+        // Stable sort: most severe first, then grouped by module and title so
+        // report ordering is deterministic across runs.
+        self.findings.sort_by(|a, b| {
+            b.severity
+                .cmp(&a.severity)
+                .then_with(|| a.module.cmp(&b.module))
+                .then_with(|| a.title.cmp(&b.title))
+        });
+    }
+
+    /// Number of findings with exactly the given severity.
+    pub fn count(&self, severity: Severity) -> usize {
+        self.findings
+            .iter()
+            .filter(|f| f.severity == severity)
+            .count()
+    }
+
+    /// Highest severity present in the report, if any.
+    pub fn max_severity(&self) -> Option<Severity> {
+        self.findings.iter().map(|f| f.severity).max()
     }
 
     /// Remove near-duplicate findings, keeping the highest-severity instance of
@@ -104,14 +191,22 @@ pub fn deduplicate_findings(findings: Vec<Finding>) -> Vec<Finding> {
     let mut sorted = findings;
     sorted.sort_by_key(|f| std::cmp::Reverse(f.severity));
 
-    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut seen: HashSet<(String, String, String)> = HashSet::new();
     let mut result = Vec::with_capacity(sorted.len());
 
     for finding in sorted {
         let url = extract_url(&finding).unwrap_or_default();
         let category = category_for(&finding);
         let url = normalize_url(&url, &category);
-        let key = (url, category);
+        // Only categories that genuinely overlap between modules are merged
+        // across modules; otherwise two modules that happen to share a title
+        // (e.g. "Open port 22/tcp") keep their own findings.
+        let scope = if category == "exposed_path" {
+            String::new()
+        } else {
+            finding.module.clone()
+        };
+        let key = (scope, url, category);
         if seen.insert(key) {
             result.push(finding);
         }
@@ -169,6 +264,25 @@ static URL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"https?://[^\s<>\
 #[cfg(test)]
 mod dedup_tests {
     use super::*;
+
+    #[test]
+    fn redacts_tokens_and_url_passwords() {
+        assert_eq!(
+            redact_secret("ghp_abcdefghijklmnopqrstuvwxyz0123456789"),
+            "ghp_********6789"
+        );
+        assert_eq!(
+            redact_secret("postgres://admin:s3cret@db.example.com/app"),
+            "postgres://admin:****@db.example.com/app"
+        );
+        assert_eq!(redact_secret("short"), "*****");
+    }
+
+    #[test]
+    fn severity_parses_from_str() {
+        assert_eq!("HIGH".parse::<Severity>().unwrap(), Severity::High);
+        assert!("bogus".parse::<Severity>().is_err());
+    }
 
     #[test]
     fn keeps_distinct_findings() {
@@ -243,6 +357,15 @@ mod dedup_tests {
 
         let deduped = deduplicate_findings(vec![http, https]);
         assert_eq!(deduped.len(), 2);
+    }
+
+    #[test]
+    fn keeps_same_title_from_different_modules() {
+        let findings = vec![
+            Finding::new("a", "done", Severity::Info, "x"),
+            Finding::new("b", "done", Severity::Info, "x"),
+        ];
+        assert_eq!(deduplicate_findings(findings).len(), 2);
     }
 
     #[test]

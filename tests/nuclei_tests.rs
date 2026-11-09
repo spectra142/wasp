@@ -14,12 +14,12 @@ fn fake_nuclei_binary() -> (TempDir, PathBuf) {
     let dir = TempDir::new().expect("failed to create temp dir");
     let path = dir.path().join("nuclei");
     let script = r#"#!/bin/sh
-# Fake nuclei: expect -u <url> -j and emit one JSON finding for that URL.
+# Fake nuclei: expect -u <url> -jsonl and emit one JSON finding for that URL.
 url=""
 while [ "$#" -gt 0 ]; do
     case "$1" in
         -u) url="$2"; shift 2 ;;
-        -j) shift ;;
+        -jsonl) shift ;;
         *) shift ;;
     esac
 done

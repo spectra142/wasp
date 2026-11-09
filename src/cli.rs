@@ -1,12 +1,8 @@
 use clap::Parser;
 use std::path::{Path, PathBuf};
 
+use crate::config::MODULE_NAMES;
 use crate::finding::{Report, Severity};
-
-const ANSI_RESET: &str = "\x1b[0m";
-const ANSI_BOLD: &str = "\x1b[1m";
-const ANSI_GREEN: &str = "\x1b[32m";
-const ANSI_GRAY: &str = "\x1b[90m";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -16,8 +12,9 @@ const ANSI_GRAY: &str = "\x1b[90m";
     long_about = "WASP is a modular security reconnaissance scanner. Only scan targets you own or have explicit permission to test."
 )]
 pub struct Args {
-    /// Target domain or IP address
-    pub target: String,
+    /// Target domain, IP address, host:port, or URL (e.g. https://example.com:8443)
+    #[arg(required_unless_present = "list_modules")]
+    pub target: Option<String>,
 
     /// Output directory for reports
     #[arg(short, long, default_value = "./wasp-report")]
@@ -28,13 +25,17 @@ pub struct Args {
     #[arg(short, long, value_delimiter = ',', conflicts_with_all = ["full", "quick"])]
     pub modules: Option<Vec<String>>,
 
-    /// Path to a custom TOML config file
+    /// Path to a custom TOML config file (merged over the built-in defaults)
     #[arg(short, long)]
     pub config: Option<PathBuf>,
 
-    /// Global concurrency limit (maximum simultaneous connections/module tasks)
-    #[arg(short, long)]
-    pub rate: Option<usize>,
+    /// Global concurrency limit (maximum simultaneous network connections)
+    #[arg(short, long, value_parser = clap::value_parser!(u32).range(1..=10_000))]
+    pub rate: Option<u32>,
+
+    /// Per-request network timeout in milliseconds
+    #[arg(short = 't', long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub timeout: Option<u64>,
 
     /// Run all modules, including external adapters
     #[arg(long, conflicts_with_all = ["modules", "quick"])]
@@ -49,22 +50,87 @@ pub struct Args {
     #[arg(long)]
     pub insecure: bool,
 
-    /// Disable active or intrusive checks
+    /// Disable the most intrusive modules (portscan, secrets, nmap, nuclei, cms, cmsenum)
     #[arg(long)]
     pub safe_mode: bool,
 
-    /// Enable verbose logging
+    /// Exit with status 2 if any finding is at or above this severity
+    /// (info, low, medium, high, critical). Useful in CI pipelines.
+    #[arg(long, value_name = "SEVERITY")]
+    pub fail_on: Option<Severity>,
+
+    /// Disable coloured terminal output (also honours the NO_COLOR variable)
+    #[arg(long)]
+    pub no_color: bool,
+
+    /// Print the available modules and exit
+    #[arg(long)]
+    pub list_modules: bool,
+
+    /// Enable verbose logging (-v info, -vv debug)
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
 }
 
-fn severity_color(severity: Severity) -> &'static str {
-    match severity {
-        Severity::Critical => "\x1b[1;31m",
-        Severity::High => "\x1b[1;33m",
-        Severity::Medium => "\x1b[33m",
-        Severity::Low => "\x1b[36m",
-        Severity::Info => "\x1b[90m",
+impl Args {
+    /// Reject module names that do not exist, instead of silently ignoring
+    /// typos like `-m tlsadit` and running nothing.
+    pub fn validate_modules(&self) -> Result<(), String> {
+        let Some(modules) = &self.modules else {
+            return Ok(());
+        };
+        let unknown: Vec<&str> = modules
+            .iter()
+            .map(|m| m.trim())
+            .filter(|m| !m.is_empty() && !MODULE_NAMES.contains(&m.to_lowercase().as_str()))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(format!(
+                "unknown module(s): {}. Available modules: {}",
+                unknown.join(", "),
+                MODULE_NAMES.join(", ")
+            ));
+        }
+        if modules.iter().all(|m| m.trim().is_empty()) {
+            return Err("no modules selected".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// ANSI styling that collapses to empty strings when colour is disabled.
+struct Palette {
+    enabled: bool,
+}
+
+impl Palette {
+    fn paint(&self, code: &'static str) -> &'static str {
+        if self.enabled {
+            code
+        } else {
+            ""
+        }
+    }
+    fn reset(&self) -> &'static str {
+        self.paint("\x1b[0m")
+    }
+    fn bold(&self) -> &'static str {
+        self.paint("\x1b[1m")
+    }
+    fn green(&self) -> &'static str {
+        self.paint("\x1b[32m")
+    }
+    fn gray(&self) -> &'static str {
+        self.paint("\x1b[90m")
+    }
+    fn severity(&self, severity: Severity) -> &'static str {
+        self.paint(match severity {
+            Severity::Critical => "\x1b[1;31m",
+            Severity::High => "\x1b[1;33m",
+            Severity::Medium => "\x1b[33m",
+            Severity::Low => "\x1b[36m",
+            Severity::Info => "\x1b[90m",
+        })
     }
 }
 
@@ -88,11 +154,25 @@ fn severity_code(severity: Severity) -> &'static str {
     }
 }
 
-/// Render a short, colored terminal summary of a completed scan.
+/// Render a short, coloured terminal summary of a completed scan.
 pub fn format_summary(report: &Report, output_dir: &Path, top_n: usize) -> String {
+    format_summary_with_color(report, output_dir, top_n, true)
+}
+
+/// Render the terminal summary, optionally without ANSI escape codes.
+pub fn format_summary_with_color(
+    report: &Report,
+    output_dir: &Path,
+    top_n: usize,
+    color: bool,
+) -> String {
+    let p = Palette { enabled: color };
     let mut lines = Vec::new();
 
-    let duration = report.finished_at.signed_duration_since(report.started_at);
+    let duration = report
+        .finished_at
+        .signed_duration_since(report.started_at)
+        .max(chrono::Duration::zero());
     let duration_str = if duration.num_seconds() < 60 {
         format!(
             "{}.{:03}s",
@@ -107,64 +187,65 @@ pub fn format_summary(report: &Report, output_dir: &Path, top_n: usize) -> Strin
         )
     };
 
-    lines.push(format!(
-        "{}═══════════════════════════════════════{}",
-        ANSI_BOLD, ANSI_RESET
-    ));
+    let rule = "═══════════════════════════════════════";
+    lines.push(format!("{}{}{}", p.bold(), rule, p.reset()));
     lines.push(format!(
         "{} WASP Scan Complete{}  {}{}{}",
-        ANSI_BOLD, ANSI_RESET, ANSI_BOLD, report.target, ANSI_RESET
+        p.bold(),
+        p.reset(),
+        p.bold(),
+        report.target,
+        p.reset()
     ));
-    lines.push(format!(
-        "{}═══════════════════════════════════════{}",
-        ANSI_BOLD, ANSI_RESET
-    ));
+    lines.push(format!("{}{}{}", p.bold(), rule, p.reset()));
     lines.push(String::new());
     lines.push(format!(
         "{}Duration: {}{}",
-        ANSI_BOLD, duration_str, ANSI_RESET
+        p.bold(),
+        duration_str,
+        p.reset()
     ));
+    if !report.modules.is_empty() {
+        lines.push(format!(
+            "{}Modules: {}{}",
+            p.bold(),
+            report.modules.join(", "),
+            p.reset()
+        ));
+    }
     lines.push(format!(
         "{}Total findings: {}{}",
-        ANSI_BOLD,
+        p.bold(),
         report.findings.len(),
-        ANSI_RESET
+        p.reset()
     ));
     lines.push(String::new());
 
-    lines.push(format!("{}Severity Summary{}", ANSI_BOLD, ANSI_RESET));
-    for severity in [
-        Severity::Critical,
-        Severity::High,
-        Severity::Medium,
-        Severity::Low,
-        Severity::Info,
-    ] {
-        let count = report
-            .findings
-            .iter()
-            .filter(|f| f.severity == severity)
-            .count();
-        let color = severity_color(severity);
-        let label = severity_label(severity);
-        lines.push(format!("  {}{:<10}: {}{}", color, label, count, ANSI_RESET));
+    lines.push(format!("{}Severity Summary{}", p.bold(), p.reset()));
+    for severity in Severity::ALL_DESCENDING {
+        lines.push(format!(
+            "  {}{:<10}: {}{}",
+            p.severity(severity),
+            severity_label(severity),
+            report.count(severity),
+            p.reset()
+        ));
     }
 
     lines.push(String::new());
-    lines.push(format!("{}Top Findings{}", ANSI_BOLD, ANSI_RESET));
+    lines.push(format!("{}Top Findings{}", p.bold(), p.reset()));
     if report.findings.is_empty() {
-        lines.push(format!(
-            "  {}No findings reported.{}",
-            ANSI_GRAY, ANSI_RESET
-        ));
+        lines.push(format!("  {}No findings reported.{}", p.gray(), p.reset()));
     } else {
         for finding in report.findings.iter().take(top_n) {
-            let color = severity_color(finding.severity);
-            let code = severity_code(finding.severity);
-            let tag = format!("[{}]", code);
+            let tag = format!("[{}]", severity_code(finding.severity));
             lines.push(format!(
                 "  {}{:<10}{} {:<12} {}",
-                color, tag, ANSI_RESET, finding.module, finding.title
+                p.severity(finding.severity),
+                tag,
+                p.reset(),
+                finding.module,
+                finding.title
             ));
         }
     }
@@ -172,10 +253,10 @@ pub fn format_summary(report: &Report, output_dir: &Path, top_n: usize) -> Strin
     lines.push(String::new());
     lines.push(format!(
         "{}Reports written to: {}{}{}",
-        ANSI_BOLD,
-        ANSI_GREEN,
+        p.bold(),
+        p.green(),
         output_dir.display(),
-        ANSI_RESET
+        p.reset()
     ));
     for name in [
         "report.json",
@@ -184,13 +265,10 @@ pub fn format_summary(report: &Report, output_dir: &Path, top_n: usize) -> Strin
         "report.md",
         "report.sarif",
     ] {
-        lines.push(format!("  {}•{} {}", ANSI_GREEN, ANSI_RESET, name));
+        lines.push(format!("  {}•{} {}", p.green(), p.reset(), name));
     }
     lines.push(String::new());
-    lines.push(format!(
-        "{}═══════════════════════════════════════{}",
-        ANSI_BOLD, ANSI_RESET
-    ));
+    lines.push(format!("{}{}{}", p.bold(), rule, p.reset()));
 
     lines.join("\n")
 }
@@ -276,6 +354,37 @@ mod tests {
         assert!(summary.contains("report.csv"));
         assert!(summary.contains("report.md"));
         assert!(summary.contains("report.sarif"));
+    }
+
+    #[test]
+    fn summary_without_color_has_no_escape_codes() {
+        let report = sample_report();
+        let summary = format_summary_with_color(&report, &PathBuf::from("./out"), 5, false);
+        assert!(!summary.contains('\x1b'));
+        assert!(summary.contains("Critical  : 1"));
+    }
+
+    #[test]
+    fn unknown_modules_are_rejected() {
+        let args = Args::try_parse_from(["wasp", "example.com", "-m", "web,tlsadit"]).unwrap();
+        let err = args.validate_modules().unwrap_err();
+        assert!(err.contains("tlsadit"));
+        let args = Args::try_parse_from(["wasp", "example.com", "-m", "web,TLSAudit"]).unwrap();
+        assert!(args.validate_modules().is_ok());
+    }
+
+    #[test]
+    fn fail_on_parses_severity() {
+        let args = Args::try_parse_from(["wasp", "example.com", "--fail-on", "high"]).unwrap();
+        assert_eq!(args.fail_on, Some(Severity::High));
+        assert!(Args::try_parse_from(["wasp", "example.com", "--fail-on", "nope"]).is_err());
+    }
+
+    #[test]
+    fn list_modules_does_not_need_target() {
+        let args = Args::try_parse_from(["wasp", "--list-modules"]).unwrap();
+        assert!(args.list_modules);
+        assert!(Args::try_parse_from(["wasp"]).is_err());
     }
 
     #[test]

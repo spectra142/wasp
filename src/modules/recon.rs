@@ -4,18 +4,21 @@ use crate::modules::Module;
 use crate::target::Target;
 use anyhow::Result;
 use async_trait::async_trait;
+use hickory_resolver::config::{ResolverConfig, CLOUDFLARE};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::proto::rr::RecordType;
+use hickory_resolver::TokioResolver;
 use log::{debug, warn};
 use regex::Regex;
-use std::fs;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use trust_dns_resolver::config::{ResolverConfig, ResolverOpts};
-use trust_dns_resolver::proto::rr::RecordType;
-use trust_dns_resolver::TokioAsyncResolver;
 use url::Host;
+
+/// Maximum WHOIS response size we are willing to buffer.
+const MAX_WHOIS_BYTES: usize = 64 * 1024;
 
 pub struct Recon;
 
@@ -52,21 +55,48 @@ impl Module for Recon {
     }
 }
 
-fn resolver() -> Result<TokioAsyncResolver> {
-    Ok(TokioAsyncResolver::tokio(
-        ResolverConfig::default(),
-        ResolverOpts::default(),
-    ))
+/// Build a DNS resolver from the system configuration (`/etc/resolv.conf` or
+/// the Windows registry), falling back to public resolvers when that fails.
+fn resolver() -> Result<TokioResolver> {
+    let system = TokioResolver::builder_tokio().and_then(|b| b.build());
+    match system {
+        Ok(r) => Ok(r),
+        Err(e) => {
+            debug!(
+                "system DNS configuration unavailable ({}); using public resolvers",
+                e
+            );
+            TokioResolver::builder_with_config(
+                ResolverConfig::udp_and_tcp(&CLOUDFLARE),
+                TokioRuntimeProvider::default(),
+            )
+            .build()
+            .map_err(|e| anyhow::anyhow!("failed to build DNS resolver: {}", e))
+        }
+    }
+}
+
+/// Render the answers of a DNS lookup as strings.
+fn record_strings(lookup: &hickory_resolver::lookup::Lookup) -> Vec<String> {
+    lookup
+        .answers()
+        .iter()
+        .map(|r| r.data.to_string())
+        .collect()
 }
 
 async fn dns_records(target: &Target, config: &Config) -> Result<Vec<Finding>> {
     let mut findings = Vec::new();
+    if !matches!(target.host, Host::Domain(_)) {
+        debug!("DNS record lookups skipped for IP target");
+        return Ok(findings);
+    }
     let host = target.host();
     let resolver = resolver()?;
     let dur = config.timeout();
 
     // A / AAAA
-    match timeout(dur, resolver.lookup_ip(&host)).await {
+    match timeout(dur, resolver.lookup_ip(host.as_str())).await {
         Ok(Ok(ips)) => {
             let records: Vec<IpAddr> = ips.iter().collect();
             if !records.is_empty() {
@@ -92,8 +122,8 @@ async fn dns_records(target: &Target, config: &Config) -> Result<Vec<Finding>> {
     }
 
     // MX
-    if let Ok(Ok(response)) = timeout(dur, resolver.lookup(&host, RecordType::MX)).await {
-        let mx: Vec<String> = response.iter().map(|r| r.to_string()).collect();
+    if let Ok(Ok(response)) = timeout(dur, resolver.lookup(host.as_str(), RecordType::MX)).await {
+        let mx = record_strings(&response);
         if !mx.is_empty() {
             findings.push(
                 Finding::new(
@@ -108,8 +138,8 @@ async fn dns_records(target: &Target, config: &Config) -> Result<Vec<Finding>> {
     }
 
     // NS
-    if let Ok(Ok(response)) = timeout(dur, resolver.lookup(&host, RecordType::NS)).await {
-        let ns: Vec<String> = response.iter().map(|r| r.to_string()).collect();
+    if let Ok(Ok(response)) = timeout(dur, resolver.lookup(host.as_str(), RecordType::NS)).await {
+        let ns = record_strings(&response);
         if !ns.is_empty() {
             findings.push(
                 Finding::new(
@@ -124,8 +154,8 @@ async fn dns_records(target: &Target, config: &Config) -> Result<Vec<Finding>> {
     }
 
     // TXT
-    if let Ok(Ok(response)) = timeout(dur, resolver.lookup(&host, RecordType::TXT)).await {
-        let txt: Vec<String> = response.iter().map(|r| r.to_string()).collect();
+    if let Ok(Ok(response)) = timeout(dur, resolver.lookup(host.as_str(), RecordType::TXT)).await {
+        let txt = record_strings(&response);
         if !txt.is_empty() {
             findings.push(
                 Finding::new(
@@ -197,11 +227,18 @@ async fn query_whois_server(server: &str, domain: &str, dur: Duration) -> String
                 warn!("WHOIS write to {} failed: {}", server, e);
                 return String::new();
             }
-            let mut buf = vec![0u8; 8192];
-            match timeout(dur, stream.read(&mut buf)).await {
-                Ok(Ok(n)) if n > 0 => String::from_utf8_lossy(&buf[..n]).to_string(),
-                _ => String::new(),
+            // WHOIS servers stream the record and then close the connection,
+            // so keep reading until EOF (bounded by size and time).
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let deadline = tokio::time::Instant::now() + dur;
+            while buf.len() < MAX_WHOIS_BYTES {
+                match tokio::time::timeout_at(deadline, stream.read(&mut chunk)).await {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                    Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+                }
             }
+            String::from_utf8_lossy(&buf).to_string()
         }
         Ok(Err(e)) => {
             debug!("WHOIS connection to {} failed: {}", server, e);
@@ -259,7 +296,7 @@ async fn detect_wildcard_dns(domain: &str, config: &Config) -> Option<String> {
 
     let mut first_ip: Option<String> = None;
     for probe in &probes {
-        match timeout(dur, resolver.lookup_ip(probe)).await {
+        match timeout(dur, resolver.lookup_ip(probe.as_str())).await {
             Ok(Ok(ips)) => {
                 let addrs: Vec<String> = ips.iter().map(|ip| ip.to_string()).collect();
                 if addrs.is_empty() {
@@ -300,36 +337,17 @@ async fn subdomain_bruteforce(target: &Target, config: &Config) -> Result<Vec<Fi
         return Ok(findings);
     }
 
-    let wordlist_path = &config.modules.recon.subdomain_wordlist;
-    let words = match fs::read_to_string(wordlist_path) {
-        Ok(content) => content
-            .lines()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>(),
-        Err(e) => {
-            warn!(
-                "failed to read subdomain wordlist {:?}: {}",
-                wordlist_path, e
-            );
-            return Ok(findings);
-        }
-    };
+    let words = crate::config::load_wordlist(
+        &config.modules.recon.subdomain_wordlist,
+        crate::config::EMBEDDED_SUBDOMAIN_WORDLIST,
+    );
 
     if words.is_empty() {
         return Ok(findings);
     }
 
     let resolver = Arc::new(resolver()?);
-    let semaphore = config
-        .scanner
-        .concurrency_semaphore
-        .clone()
-        .unwrap_or_else(|| {
-            Arc::new(tokio::sync::Semaphore::new(
-                config.scanner.concurrency.max(1),
-            ))
-        });
+    let semaphore = config.request_limiter();
     let dur = config.timeout();
     let mut handles = Vec::new();
 
@@ -339,7 +357,7 @@ async fn subdomain_bruteforce(target: &Target, config: &Config) -> Result<Vec<Fi
         let resolver = Arc::clone(&resolver);
         let handle = tokio::spawn(async move {
             let _permit = permit;
-            match timeout(dur, resolver.lookup_ip(&full)).await {
+            match timeout(dur, resolver.lookup_ip(full.as_str())).await {
                 Ok(Ok(ips)) => {
                     let addrs: Vec<String> = ips.iter().map(|ip| ip.to_string()).collect();
                     if !addrs.is_empty() {
@@ -399,31 +417,6 @@ async fn tech_fingerprint(target: &Target, config: &Config) -> Result<Vec<Findin
         v
     };
 
-    let fingerprints: Vec<(&str, Regex)> = vec![
-        (
-            "WordPress",
-            Regex::new(r#"/wp-content/|/wp-includes/"#).unwrap(),
-        ),
-        (
-            "Drupal",
-            Regex::new(r#"/sites/default/|Drupal.settings"#).unwrap(),
-        ),
-        ("Joomla", Regex::new(r#"/media/jui/|/templates/"#).unwrap()),
-        (
-            "React",
-            Regex::new(r#"reactroot|__REACT__|data-reactroot"#).unwrap(),
-        ),
-        ("Angular", Regex::new(r#"ng-app|angular"#).unwrap()),
-        ("Vue.js", Regex::new(r#"vue-router|__VUE__"#).unwrap()),
-        (
-            "Bootstrap",
-            Regex::new(r#"bootstrap|bootstrapcdn"#).unwrap(),
-        ),
-        ("jQuery", Regex::new(r#"jquery"#).unwrap()),
-        ("PHP", Regex::new(r#"\.php|PHP/"#).unwrap()),
-        ("ASP.NET", Regex::new(r#"ASP.NET|__VIEWSTATE"#).unwrap()),
-    ];
-
     for url in urls {
         let resp = match client.get(&url).send().await {
             Ok(r) => r,
@@ -435,7 +428,12 @@ async fn tech_fingerprint(target: &Target, config: &Config) -> Result<Vec<Findin
 
         let headers = resp.headers().clone();
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = crate::http::read_body(resp).await;
+        let header_text = headers
+            .iter()
+            .map(|(k, v)| format!("{}: {}", k, String::from_utf8_lossy(v.as_bytes())))
+            .collect::<Vec<_>>()
+            .join("\n");
 
         let mut detected = Vec::new();
 
@@ -449,8 +447,8 @@ async fn tech_fingerprint(target: &Target, config: &Config) -> Result<Vec<Findin
             detected.push(format!("Via: {}", via));
         }
 
-        for (name, re) in &fingerprints {
-            if re.is_match(&body) || re.is_match(&format!("{:?}", headers)) {
+        for (name, re) in FINGERPRINTS.iter() {
+            if re.is_match(&body) || re.is_match(&header_text) {
                 detected.push(name.to_string());
             }
         }
@@ -479,4 +477,67 @@ async fn tech_fingerprint(target: &Target, config: &Config) -> Result<Vec<Findin
     }
 
     Ok(findings)
+}
+
+/// Technology fingerprints matched against response bodies and headers.
+static FINGERPRINTS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
+    [
+        ("WordPress", r"/wp-content/|/wp-includes/"),
+        ("Drupal", r"/sites/default/files|Drupal\.settings|X-Drupal-"),
+        (
+            "Joomla",
+            r"/media/jui/|/media/system/js/|(?i)content=.joomla",
+        ),
+        (
+            "React",
+            r"data-reactroot|__REACT_DEVTOOLS|react-dom(?:\.production)?(?:\.min)?\.js",
+        ),
+        ("Next.js", r"__NEXT_DATA__|/_next/static/"),
+        ("Angular", r"\bng-version=|\bng-app\b"),
+        (
+            "Vue.js",
+            r"data-v-[0-9a-f]{8}|__VUE__|vue(?:\.runtime)?(?:\.global)?(?:\.prod)?(?:\.min)?\.js",
+        ),
+        (
+            "Bootstrap",
+            r"(?i)bootstrap(?:\.bundle)?(?:\.min)?\.(?:css|js)",
+        ),
+        ("jQuery", r"(?i)jquery(?:-\d[\d.]*)?(?:\.min)?\.js"),
+        ("PHP", r"(?i)X-Powered-By: PHP|PHPSESSID"),
+        (
+            "ASP.NET",
+            r"(?i)X-AspNet-Version|__VIEWSTATE|ASP\.NET_SessionId",
+        ),
+        ("Cloudflare", r"(?i)cf-ray:|server: cloudflare"),
+    ]
+    .into_iter()
+    .map(|(name, pattern)| (name, Regex::new(pattern).expect("valid fingerprint regex")))
+    .collect()
+});
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn whois_referral_is_extracted_with_default_port() {
+        let text = "domain: COM\nrefer: whois.verisign-grs.com\n";
+        assert_eq!(
+            extract_whois_referral(text).as_deref(),
+            Some("whois.verisign-grs.com:43")
+        );
+    }
+
+    #[test]
+    fn fingerprints_compile_and_match() {
+        let body = r#"<script src="/wp-includes/js/jquery/jquery.min.js"></script>"#;
+        let names: Vec<&str> = FINGERPRINTS
+            .iter()
+            .filter(|(_, re)| re.is_match(body))
+            .map(|(n, _)| *n)
+            .collect();
+        assert!(names.contains(&"WordPress"));
+        assert!(names.contains(&"jQuery"));
+        assert!(!names.contains(&"PHP"));
+    }
 }

@@ -100,7 +100,7 @@ async fn handle_request(mut socket: TcpStream) {
     } else {
         let parts: Vec<&str> = request_line.split_whitespace().collect();
         (
-            parts.get(0).copied().unwrap_or("GET").to_uppercase(),
+            parts.first().copied().unwrap_or("GET").to_uppercase(),
             parts.get(1).copied().unwrap_or("/"),
         )
     };

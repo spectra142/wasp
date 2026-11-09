@@ -86,7 +86,7 @@ pub async fn fetch(client: &Client, url: &str) -> Option<HttpResponse> {
         Ok(resp) => {
             let status = resp.status();
             let final_url = resp.url().clone();
-            let body = resp.text().await.unwrap_or_default();
+            let body = crate::http::read_body(resp).await;
             Some(HttpResponse {
                 status,
                 body,
